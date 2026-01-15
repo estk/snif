@@ -1,0 +1,20 @@
+minimumLimaVersion: 2.0.0
+
+base:
+  - template:debian-13
+
+memory: 16GiB
+
+upgradePackages: true
+
+user:
+  name: lima
+
+mounts:
+  - location: "~/git"
+    mountPoint: "{{.Home}}/git"
+    writable: true
+
+  - location: "{{.GlobalTempDir}}/lima"
+    mountPoint: /tmp/lima
+    writable: true

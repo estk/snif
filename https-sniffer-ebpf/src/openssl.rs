@@ -1,6 +1,7 @@
-use aya_bpf::{
+use aya_ebpf::programs::RetProbeContext;
+use aya_ebpf::{
     cty::c_void,
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, gen::bpf_probe_read_user},
+    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, generated::bpf_probe_read_user},
     macros::{map, uprobe, uretprobe},
     maps::{HashMap, PerCpuArray, PerfEventArray},
     programs::ProbeContext,
@@ -9,10 +10,10 @@ use aya_log_ebpf::info;
 use https_sniffer_common::{Data, Kind, MAX_BUF_SIZE};
 
 #[map]
-static mut STORAGE: PerCpuArray<Data> = PerCpuArray::with_max_entries(1, 0);
+static STORAGE: PerCpuArray<Data> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
-static mut EVENTS: PerfEventArray<Data> = PerfEventArray::with_max_entries(1024, 0);
+static EVENTS: PerfEventArray<Data> = PerfEventArray::new(0);
 
 #[map]
 static mut BUFFERS: HashMap<u32, *const u8> = HashMap::with_max_entries(1024, 0);
@@ -26,7 +27,7 @@ pub fn ssl_read(ctx: ProbeContext) -> u32 {
 }
 
 #[uretprobe]
-pub fn ssl_read_ret(ctx: ProbeContext) -> u32 {
+pub fn ssl_read_ret(ctx: RetProbeContext) -> u32 {
     match try_ssl_ret(ctx, Kind::Read) {
         Ok(ret) => ret,
         Err(ret) => ret,
@@ -42,7 +43,7 @@ pub fn ssl_write(ctx: ProbeContext) -> u32 {
 }
 
 #[uretprobe]
-pub fn ssl_write_ret(ctx: ProbeContext) -> u32 {
+pub fn ssl_write_ret(ctx: RetProbeContext) -> u32 {
     match try_ssl_ret(ctx, Kind::Write) {
         Ok(ret) => ret,
         Err(ret) => ret,
@@ -60,10 +61,10 @@ fn try_ssl(ctx: ProbeContext) -> Result<u32, u32> {
 }
 
 // `try_ssl_ret` function is an eBPF probe for handling the return value of an SSL function.
-fn try_ssl_ret(ctx: ProbeContext, kind: Kind) -> Result<u32, u32> {
+fn try_ssl_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
     // `retval` represents the number of bytes actually read from the TLS/SSL connection.
     // This value is crucial as it indicates the success of the read operation and the size of the data read.
-    let retval: i32 = ctx.ret().ok_or(0u32)?;
+    let retval: i32 = ctx.ret();
     if retval <= 0 {
         return Ok(0);
     }

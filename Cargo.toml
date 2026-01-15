@@ -1,2 +1,19 @@
 [workspace]
-members = ["xtask", "https-sniffer", "https-sniffer-common"]
+members = ["https-sniffer", "https-sniffer-common", "https-sniffer-ebpf"]
+resolver = "2"
+default-members = ["https-sniffer", "https-sniffer-common"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+
+[workspace.dependencies]
+aya = { git = "https://github.com/aya-rs/aya" }
+aya-ebpf = { git = "https://github.com/aya-rs/aya" }
+aya-log = { git = "https://github.com/aya-rs/aya" }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya" }
+https-sniffer-common = { path = "./https-sniffer-common" }
+
+[profile.release.package.https-sniffer-ebpf]
+debug = 2
+codegen-units = 1

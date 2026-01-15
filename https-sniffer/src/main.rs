@@ -1,40 +1,41 @@
-use aya::maps::AsyncPerfEventArray;
+use aya::maps::perf::Events;
+use aya::maps::perf::PerfEventArray;
 use aya::programs::UProbe;
 use aya::util::online_cpus;
-use aya::{include_bytes_aligned, Bpf};
-use aya_log::BpfLogger;
+use aya::Ebpf;
+use aya_log::EbpfLogger;
 use bytes::BytesMut;
 use clap::Parser;
 use https_sniffer_common::Data;
-use log::{debug, info, warn};
+use log::{debug, info, };
 use tokio::signal;
 
 #[derive(Debug, Parser)]
 struct Opt {
     #[clap(short, long)]
-    pid: Option<i32>,
+    pid: Option<u32>,
 }
 
-const OPEN_SSL_PATH: &str = "/lib/x86_64-linux-gnu/libssl.so.3";
+const OPEN_SSL_PATH: &str = "/lib/aarch64-linux-gnu/libssl.so.3";
 
-fn attach_openssl(bpf: &mut Bpf, opt: &Opt) -> Result<(), anyhow::Error> {
+fn attach_openssl(bpf: &mut Ebpf, opt: &Opt) -> Result<(), anyhow::Error> {
     // Attach uprobe and uretprobe to SSL_read
     let p_write: &mut UProbe = bpf.program_mut("ssl_write").unwrap().try_into()?;
     p_write.load()?;
-    p_write.attach(Some("SSL_write"), 0, OPEN_SSL_PATH, opt.pid)?;
+    p_write.attach("SSL_write", OPEN_SSL_PATH, opt.pid)?;
 
     let p_write_ret: &mut UProbe = bpf.program_mut("ssl_write_ret").unwrap().try_into()?;
     p_write_ret.load()?;
-    p_write_ret.attach(Some("SSL_write"), 0, OPEN_SSL_PATH, opt.pid)?;
+    p_write_ret.attach("SSL_write", OPEN_SSL_PATH, opt.pid)?;
 
     // Attach uprobe and uretprobe to SSL_write
     let p_read: &mut UProbe = bpf.program_mut("ssl_read").unwrap().try_into()?;
     p_read.load()?;
-    p_read.attach(Some("SSL_read"), 0, OPEN_SSL_PATH, opt.pid)?;
+    p_read.attach("SSL_read", OPEN_SSL_PATH, opt.pid)?;
 
     let p_read_ret: &mut UProbe = bpf.program_mut("ssl_read_ret").unwrap().try_into()?;
     p_read_ret.load()?;
-    p_read_ret.attach(Some("SSL_read"), 0, OPEN_SSL_PATH, opt.pid)?;
+    p_read_ret.attach("SSL_read", OPEN_SSL_PATH, opt.pid)?;
 
     Ok(())
 }
@@ -59,32 +60,35 @@ async fn main() -> Result<(), anyhow::Error> {
     // This will include your eBPF object file as raw bytes at compile-time and load it at
     // runtime. This approach is recommended for most real-world use cases. If you would
     // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
-    #[cfg(debug_assertions)]
-    let mut bpf = Bpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/debug/https-sniffer"
-    ))?;
-    #[cfg(not(debug_assertions))]
-    let mut bpf = Bpf::load(include_bytes_aligned!(
-        "../../target/bpfel-unknown-none/release/https-sniffer"
-    ))?;
-    if let Err(e) = BpfLogger::init(&mut bpf) {
-        // This can happen if you remove all log statements from your eBPF program.
-        warn!("failed to initialize eBPF logger: {}", e);
-    }
+    // reach for `Ebpf::load_file` instead.
+    let mut bpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
+        env!("OUT_DIR"),
+        "/https-sniffer"
+    )))?;
 
-    // Attach uprobe and uretprobe to OpenSSL.
+    // init logger
+    let logger = EbpfLogger::init(&mut bpf).unwrap();
+    let mut logger =
+        tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE).unwrap(); // Attach uprobe and uretprobe to OpenSSL.
+    tokio::task::spawn(async move {
+        loop {
+            let mut guard = logger.readable_mut().await.unwrap();
+            guard.get_inner_mut().flush();
+            guard.clear_ready();
+        }
+    });
     attach_openssl(&mut bpf, &opt)?;
 
     // Retrieve the perf event array from the BPF program to read events from it.
-    let mut perf_array = AsyncPerfEventArray::try_from(bpf.take_map("EVENTS").unwrap())?;
+    let mut perf_array = PerfEventArray::try_from(bpf.take_map("EVENTS").unwrap())?;
 
     // Calculate the size of the Data structure in bytes.
     let len_of_data = std::mem::size_of::<Data>();
     // Iterate over each online CPU core. For eBPF applications, processing is often done per CPU core.
-    for cpu_id in online_cpus()? {
+    for cpu_id in online_cpus().map_err(|(_, error)| error)? {
         // open a separate perf buffer for each cpu
-        let mut buf = perf_array.open(cpu_id, Some(32))?;
+        let buf = perf_array.open(cpu_id, Some(32))?;
+        let mut buf = tokio::io::unix::AsyncFd::with_interest(buf, tokio::io::Interest::READABLE)?;
 
         // process each perf buffer in a separate task
         tokio::spawn(async move {
@@ -95,18 +99,12 @@ async fn main() -> Result<(), anyhow::Error> {
                 .collect::<Vec<_>>();
 
             loop {
-                // Attempt to read events from the perf buffer into the prepared buffers.
-                let events = match buf.read_events(&mut buffers).await {
-                    Ok(events) => events,
-                    Err(e) => {
-                        warn!("Error reading events: {}", e);
-                        continue;
-                    }
-                };
+                let mut guard = buf.readable_mut().await.unwrap();
+                let Events { read, lost: _ } =
+                    guard.get_inner_mut().read_events(&mut buffers).unwrap();
 
                 // Iterate over the number of events read. `events.read` indicates how many events were read.
-                for i in 0..events.read {
-                    let buf = &mut buffers[i];
+                for buf in buffers.iter_mut().take(read) {
                     let data = buf.as_ptr() as *const Data; // Cast the buffer pointer to a Data pointer.
                     info!("{}", unsafe { *data });
                 }
