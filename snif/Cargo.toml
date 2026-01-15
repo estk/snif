@@ -49,6 +49,7 @@ snif-ebpf = { path = "../snif-ebpf" }
 
 [dev-dependencies]
 regex = "1"
+rstest = "0.23"
 
 [[bin]]
 name = "snif"

@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use regex::Regex;
+use rstest::rstest;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -169,59 +170,50 @@ impl Sniffer {
     }
 }
 
+// ============================================================================
+// HTTP request tests (parameterized)
+// ============================================================================
+
+#[rstest]
+#[case::http1_get(
+    &["-s", "--http1.1", "http://httpbin.org/get"],
+    "HTTP/1.1 Exchange",
+    "GET /get"
+)]
+#[case::http1_post(
+    &["-s", "--http1.1", "-X", "POST", "-H", "Content-Type: application/json", "-d", r#"{"test":"data"}"#, "http://httpbin.org/post"],
+    "HTTP/1.1 Exchange",
+    "POST /post"
+)]
+#[case::http2_get(
+    &["-s", "https://httpbin.org/get"],
+    "HTTP/2 Exchange",
+    "GET /get"
+)]
 #[tokio::test]
-async fn test_http1_get_request() {
+async fn test_http_request(
+    #[case] curl_args: &[&str],
+    #[case] expected_exchange: &str,
+    #[case] expected_method_path: &str,
+) {
     let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
 
-    // Make HTTP/1.1 GET request using curl
-    curl(&["-s", "--http1.1", "http://httpbin.org/get"])
-        .await
-        .unwrap();
+    curl(curl_args).await.unwrap();
 
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
     assert!(
-        output.contains("HTTP/1.1 Exchange"),
-        "HTTP/1.1 exchange not captured"
+        output.contains(expected_exchange),
+        "{} exchange not captured",
+        expected_exchange
     );
     assert!(
-        output.contains("GET /get"),
-        "GET method and path not captured"
+        output.contains(expected_method_path),
+        "{} not captured",
+        expected_method_path
     );
     assert!(output.contains("200 OK"), "200 OK response not captured");
-}
-
-#[tokio::test]
-async fn test_http1_post_request() {
-    let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
-
-    // Make HTTP/1.1 POST request using curl
-    curl(&[
-        "-s",
-        "--http1.1",
-        "-X",
-        "POST",
-        "-H",
-        "Content-Type: application/json",
-        "-d",
-        r#"{"test":"data"}"#,
-        "http://httpbin.org/post",
-    ])
-    .await
-    .unwrap();
-
-    sniffer.collect_for(Duration::from_secs(2)).await;
-    let output = sniffer.stop().await;
-
-    assert!(
-        output.contains("HTTP/1.1 Exchange"),
-        "HTTP/1.1 POST exchange not captured"
-    );
-    assert!(
-        output.contains("POST /post"),
-        "POST method and path not captured"
-    );
 }
 
 #[tokio::test]
@@ -240,30 +232,12 @@ async fn test_http1_latency() {
     assert!(output.contains(latency_re), "Latency > 0ms not measured");
 }
 
+#[rstest]
+#[case::ssl_handshake(&["--raw"], "SSL Handshake")]
+#[case::handshake_duration(&["--raw"], "Duration:")]
 #[tokio::test]
-async fn test_http2_https_request() {
-    let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
-
-    // Make HTTPS request (curl uses HTTP/2 by default for HTTPS)
-    curl(&["-s", "https://httpbin.org/get"]).await.unwrap();
-
-    sniffer.collect_for(Duration::from_secs(2)).await;
-    let output = sniffer.stop().await;
-
-    assert!(
-        output.contains("HTTP/2 Exchange"),
-        "HTTP/2 exchange not captured"
-    );
-    assert!(
-        output.contains("GET /get"),
-        "GET method and path not captured via HPACK"
-    );
-    assert!(output.contains("200 OK"), "200 OK response not captured");
-}
-
-#[tokio::test]
-async fn test_ssl_handshake_events() {
-    let mut sniffer = Sniffer::start(&["--raw"]).await.unwrap();
+async fn test_ssl_events(#[case] sniffer_args: &[&str], #[case] expected_pattern: &str) {
+    let mut sniffer = Sniffer::start(sniffer_args).await.unwrap();
 
     curl(&["-s", "https://httpbin.org/get"]).await.unwrap();
 
@@ -271,12 +245,9 @@ async fn test_ssl_handshake_events() {
     let output = sniffer.stop().await;
 
     assert!(
-        output.contains("SSL Handshake"),
-        "SSL handshake event not captured"
-    );
-    assert!(
-        output.contains("Duration:"),
-        "Handshake duration not captured"
+        output.contains(expected_pattern),
+        "{} not captured",
+        expected_pattern
     );
 }
 
@@ -299,8 +270,11 @@ async fn test_multiple_concurrent_requests() {
     assert!(count >= 3, "Expected at least 3 exchanges, got {}", count);
 }
 
+#[rstest]
+#[case::socket_write("Kind: Socket Write")]
+#[case::socket_read("Kind: Socket Read")]
 #[tokio::test]
-async fn test_raw_socket_events() {
+async fn test_raw_socket_events(#[case] expected_pattern: &str) {
     let mut sniffer = Sniffer::start(&["--raw"]).await.unwrap();
 
     curl(&["-s", "--http1.1", "http://httpbin.org/get"])
@@ -311,12 +285,9 @@ async fn test_raw_socket_events() {
     let output = sniffer.stop().await;
 
     assert!(
-        output.contains("Kind: Socket Write"),
-        "Socket write event not captured"
-    );
-    assert!(
-        output.contains("Kind: Socket Read"),
-        "Socket read event not captured"
+        output.contains(expected_pattern),
+        "{} not captured",
+        expected_pattern
     );
 }
 
@@ -407,100 +378,41 @@ impl Drop for LocalServer {
     }
 }
 
+#[rstest]
+#[case::local_port_matches(18080, &["--raw", "--local-port", "18080"], 2, ">=")]
+#[case::local_port_filter(18081, &["--raw", "--local-port", "18081"], 1, ">=")]
+#[case::direction_incoming(18082, &["--raw", "--local-port", "18082", "--direction", "incoming"], 1, ">=")]
+#[case::direction_outgoing(18083, &["--raw", "--local-port", "18083", "--direction", "outgoing"], 1, "==")]
 #[tokio::test]
-async fn test_local_port_filter_matches() {
-    let server = LocalServer::start(18080).await.unwrap();
-    let mut sniffer = Sniffer::start(&["--raw", "--local-port", "18080"])
-        .await
-        .unwrap();
+async fn test_filter(
+    #[case] port: u16,
+    #[case] sniffer_args: &[&str],
+    #[case] expected_count: usize,
+    #[case] comparison: &str,
+) {
+    let server = LocalServer::start(port).await.unwrap();
+    let mut sniffer = Sniffer::start(sniffer_args).await.unwrap();
 
-    // Make request to matching port
     curl(&["-s", "--http1.1", &server.url()]).await.unwrap();
 
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
+
     let socket_event_count = output.count("Kind: Socket");
 
-    assert!(
-        socket_event_count >= 2,
-        "Traffic on matching port should be captured, so >= 2 events got {socket_event_count}"
-    );
-
-    assert!(
-        output.contains("Kind: Socket"),
-        "Traffic on matching port should be captured"
-    );
-}
-
-#[tokio::test]
-async fn test_local_port_filter_excludes() {
-    let server = LocalServer::start(18081).await.unwrap();
-    let mut sniffer = Sniffer::start(&["--raw", "--local-port", "18081"])
-        .await
-        .unwrap();
-
-    // Make request to non-matching port
-    curl(&["-s", "--http1.1", &server.url()]).await.unwrap();
-
-    sniffer.collect_for(Duration::from_secs(2)).await;
-    let output = sniffer.stop().await;
-
-    // Filter out startup messages - look for actual socket events from our request
-    let socket_event_count = output.count("Kind: Socket");
-
-    assert!(
-        socket_event_count >= 1,
-        "Traffic on non-matching port should NOT be captured"
-    );
-}
-
-#[tokio::test]
-async fn test_direction_incoming_filter() {
-    let server = LocalServer::start(18082).await.unwrap();
-    let mut sniffer =
-        Sniffer::start(&["--raw", "--local-port", "18082", "--direction", "incoming"])
-            .await
-            .unwrap();
-
-    // Make request - the server receives incoming traffic
-    curl(&["-s", "--http1.1", &server.url()]).await.unwrap();
-
-    sniffer.collect_for(Duration::from_secs(2)).await;
-    let output = sniffer.stop().await;
-
-    // Incoming filter on local port 18082 means we capture:
-    // - Reads on port 18082 (server reading client request)
-    // - Writes on port 18082 (server sending response)
-    assert!(
-        output.contains("Kind: Socket"),
-        "Incoming traffic should be captured when filtering for incoming on server port"
-    );
-}
-
-#[tokio::test]
-async fn test_direction_outgoing_filter() {
-    let server = LocalServer::start(18083).await.unwrap();
-    let mut sniffer =
-        Sniffer::start(&["--raw", "--local-port", "18083", "--direction", "outgoing"])
-            .await
-            .unwrap();
-
-    // Make request - from curl's perspective, traffic to port 18083 is outgoing
-    curl(&["-s", "--http1.1", &server.url()]).await.unwrap();
-
-    sniffer.collect_for(Duration::from_secs(2)).await;
-    let output = sniffer.stop().await;
-
-    // Outgoing filter with local-port 18083: captures traffic where
-    // the local port is 18083 AND direction is outgoing (from the socket owner's view).
-    // For the server, writes are "outgoing" from its perspective.
-    // The test verifies the filter combination works.
-    let socket_events = output.count("Kind: Socket");
-
-    // With outgoing filter on the server port, we should see server's outgoing responses
-    // but the exact behavior depends on implementation
-    assert!(
-        socket_events == 1,
-        "Outgoing filter test executed without error"
-    );
+    match comparison {
+        ">=" => assert!(
+            socket_event_count >= expected_count,
+            "Expected >= {} socket events, got {}",
+            expected_count,
+            socket_event_count
+        ),
+        "==" => assert!(
+            socket_event_count == expected_count,
+            "Expected == {} socket events, got {}",
+            expected_count,
+            socket_event_count
+        ),
+        _ => panic!("Unknown comparison: {}", comparison),
+    }
 }
