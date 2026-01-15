@@ -9,14 +9,25 @@ use aya_ebpf::{
 use aya_log_ebpf::info;
 use https_sniffer_common::{Data, Kind, MAX_BUF_SIZE};
 
-#[map]
-static STORAGE: PerCpuArray<Data> = PerCpuArray::with_max_entries(1, 0);
+// Entry data stored between uprobe entry and return
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EntryData {
+    pub buf_p: *const u8,
+    pub fd: i32,
+}
 
 #[map]
-static EVENTS: PerfEventArray<Data> = PerfEventArray::new(0);
+pub static STORAGE: PerCpuArray<Data> = PerCpuArray::with_max_entries(1, 0);
 
 #[map]
-static mut BUFFERS: HashMap<u32, *const u8> = HashMap::with_max_entries(1024, 0);
+pub static EVENTS: PerfEventArray<Data> = PerfEventArray::new(0);
+
+#[map]
+pub static mut BUFFERS: HashMap<u32, EntryData> = HashMap::with_max_entries(1024, 0);
+
+#[map]
+pub static mut SSL_BUFFERS: HashMap<u32, EntryData> = HashMap::with_max_entries(1024, 0);
 
 #[uprobe]
 pub fn ssl_read(ctx: ProbeContext) -> u32 {
@@ -28,7 +39,7 @@ pub fn ssl_read(ctx: ProbeContext) -> u32 {
 
 #[uretprobe]
 pub fn ssl_read_ret(ctx: RetProbeContext) -> u32 {
-    match try_ssl_ret(ctx, Kind::Read) {
+    match try_ssl_ret(ctx, Kind::SslRead) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
@@ -44,7 +55,7 @@ pub fn ssl_write(ctx: ProbeContext) -> u32 {
 
 #[uretprobe]
 pub fn ssl_write_ret(ctx: RetProbeContext) -> u32 {
-    match try_ssl_ret(ctx, Kind::Write) {
+    match try_ssl_ret(ctx, Kind::SslWrite) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
@@ -55,8 +66,10 @@ fn try_ssl(ctx: ProbeContext) -> Result<u32, u32> {
     let tgid: u32 = bpf_get_current_pid_tgid() as u32;
     // Get the buffer pointer (second argument of the probed function) from the context.
     let buf_p: *const u8 = ctx.arg(1).ok_or(0_u32)?;
-    // Insert the buffer pointer into the `BUFFERS` map for the current process/thread group.
-    unsafe { BUFFERS.insert(&tgid, &buf_p, 0).map_err(|e| e as u8)? };
+    // SSL functions don't expose fd directly, so we set it to -1
+    let entry = EntryData { buf_p, fd: -1 };
+    // Insert the entry data into the `SSL_BUFFERS` map for the current process/thread group.
+    unsafe { SSL_BUFFERS.insert(&tgid, &entry, 0).map_err(|e| e as u8)? };
     Ok(0)
 }
 
@@ -70,13 +83,13 @@ fn try_ssl_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
     }
 
     let tgid: u32 = bpf_get_current_pid_tgid() as u32;
-    // Retrieve the buffer pointer from the `BUFFERS` map for the current process/thread group.
-    let buf_p = unsafe {
-        let ptr = BUFFERS.get(&tgid).ok_or(0_u32)?;
+    // Retrieve the entry data from the `SSL_BUFFERS` map for the current process/thread group.
+    let entry = unsafe {
+        let ptr = SSL_BUFFERS.get(&tgid).ok_or(0_u32)?;
         *ptr
     };
 
-    if buf_p.is_null() {
+    if entry.buf_p.is_null() {
         return Ok(0);
     }
 
@@ -93,6 +106,7 @@ fn try_ssl_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
     // Populate the `Data` structure with the required data.
     data.kind = kind;
     data.len = retval;
+    data.port = 0; // SSL doesn't expose socket fd directly
     data.comm = bpf_get_current_comm().map_err(|e| e as u32)?;
 
     // Limit the read buffer size to either the actual data size or the predefined maximum buffer size.
@@ -108,7 +122,7 @@ fn try_ssl_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
         let ret = bpf_probe_read_user(
             data.buf.as_mut_ptr() as *mut c_void,
             buffer_limit,
-            buf_p as *const c_void,
+            entry.buf_p as *const c_void,
         );
 
         if ret != 0 {
@@ -117,16 +131,11 @@ fn try_ssl_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
         }
 
         // Remove the buffer entry to clean up and avoid stale data in subsequent operations.
-        BUFFERS.remove(&tgid).map_err(|e| e as u8)?;
+        SSL_BUFFERS.remove(&tgid).map_err(|e| e as u8)?;
         // Emit the captured data as an event, enabling further analysis or monitoring.
         // This is typically where the eBPF program interfaces with external observers or tools.
         EVENTS.output(&ctx, &(*data), 0);
     }
 
     Ok(0)
-}
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    unsafe { core::hint::unreachable_unchecked() }
 }

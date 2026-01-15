@@ -12,11 +12,17 @@ use tokio::signal;
 
 #[derive(Debug, Parser)]
 struct Opt {
+    /// Filter by process ID
     #[clap(short, long)]
     pid: Option<u32>,
+
+    /// Filter by foreign (remote) port (e.g., 80 for HTTP, 443 for HTTPS)
+    #[clap(long)]
+    port: Option<u16>,
 }
 
 const OPEN_SSL_PATH: &str = "/lib/aarch64-linux-gnu/libssl.so.3";
+const LIBC_PATH: &str = "/lib/aarch64-linux-gnu/libc.so.6";
 
 fn attach_openssl(bpf: &mut Ebpf, opt: &Opt) -> Result<(), anyhow::Error> {
     // Attach uprobe and uretprobe to SSL_read
@@ -36,6 +42,46 @@ fn attach_openssl(bpf: &mut Ebpf, opt: &Opt) -> Result<(), anyhow::Error> {
     let p_read_ret: &mut UProbe = bpf.program_mut("ssl_read_ret").unwrap().try_into()?;
     p_read_ret.load()?;
     p_read_ret.attach("SSL_read", OPEN_SSL_PATH, opt.pid)?;
+
+    Ok(())
+}
+
+fn attach_libc(bpf: &mut Ebpf, opt: &Opt) -> Result<(), anyhow::Error> {
+    // Attach uprobe and uretprobe to read
+    let p_read: &mut UProbe = bpf.program_mut("libc_read").unwrap().try_into()?;
+    p_read.load()?;
+    p_read.attach("read", LIBC_PATH, opt.pid)?;
+
+    let p_read_ret: &mut UProbe = bpf.program_mut("libc_read_ret").unwrap().try_into()?;
+    p_read_ret.load()?;
+    p_read_ret.attach("read", LIBC_PATH, opt.pid)?;
+
+    // Attach uprobe and uretprobe to write
+    let p_write: &mut UProbe = bpf.program_mut("libc_write").unwrap().try_into()?;
+    p_write.load()?;
+    p_write.attach("write", LIBC_PATH, opt.pid)?;
+
+    let p_write_ret: &mut UProbe = bpf.program_mut("libc_write_ret").unwrap().try_into()?;
+    p_write_ret.load()?;
+    p_write_ret.attach("write", LIBC_PATH, opt.pid)?;
+
+    // Attach uprobe and uretprobe to recv
+    let p_recv: &mut UProbe = bpf.program_mut("libc_recv").unwrap().try_into()?;
+    p_recv.load()?;
+    p_recv.attach("recv", LIBC_PATH, opt.pid)?;
+
+    let p_recv_ret: &mut UProbe = bpf.program_mut("libc_recv_ret").unwrap().try_into()?;
+    p_recv_ret.load()?;
+    p_recv_ret.attach("recv", LIBC_PATH, opt.pid)?;
+
+    // Attach uprobe and uretprobe to send
+    let p_send: &mut UProbe = bpf.program_mut("libc_send").unwrap().try_into()?;
+    p_send.load()?;
+    p_send.attach("send", LIBC_PATH, opt.pid)?;
+
+    let p_send_ret: &mut UProbe = bpf.program_mut("libc_send_ret").unwrap().try_into()?;
+    p_send_ret.load()?;
+    p_send_ret.attach("send", LIBC_PATH, opt.pid)?;
 
     Ok(())
 }
@@ -78,12 +124,15 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     });
     attach_openssl(&mut bpf, &opt)?;
+    attach_libc(&mut bpf, &opt)?;
 
     // Retrieve the perf event array from the BPF program to read events from it.
     let mut perf_array = PerfEventArray::try_from(bpf.take_map("EVENTS").unwrap())?;
 
     // Calculate the size of the Data structure in bytes.
     let len_of_data = std::mem::size_of::<Data>();
+    let port_filter = opt.port;
+
     // Iterate over each online CPU core. For eBPF applications, processing is often done per CPU core.
     for cpu_id in online_cpus().map_err(|(_, error)| error)? {
         // open a separate perf buffer for each cpu
@@ -106,7 +155,17 @@ async fn main() -> Result<(), anyhow::Error> {
                 // Iterate over the number of events read. `events.read` indicates how many events were read.
                 for buf in buffers.iter_mut().take(read) {
                     let data = buf.as_ptr() as *const Data; // Cast the buffer pointer to a Data pointer.
-                    info!("{}", unsafe { *data });
+                    let data_ref = unsafe { &*data };
+
+                    // Apply port filter if specified
+                    if let Some(filter_port) = port_filter {
+                        // Skip if port doesn't match (port 0 means unknown, always show those)
+                        if data_ref.port != 0 && data_ref.port != filter_port {
+                            continue;
+                        }
+                    }
+
+                    info!("{}", data_ref);
                 }
             }
         });
