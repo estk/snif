@@ -18,3 +18,28 @@ mounts:
   - location: "{{.GlobalTempDir}}/lima"
     mountPoint: /tmp/lima
     writable: true
+
+provision:
+  - mode: user
+    script: |
+      #!/bin/bash -ex
+
+      sudo apt update
+      sudo apt install -y lsb-release wget gnupg zstd libzstd-dev \
+        bpftool gpg build-essential git protobuf-compiler pkg-config libssl-dev
+
+      # LLVM required for bpf-linker
+      wget https://apt.llvm.org/llvm.sh
+      chmod +x llvm.sh
+      sudo ./llvm.sh 21 all
+
+      # Install Rustup, cargo-binstall
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+      source ~/.profile
+
+      # Install bpf-linker
+      cargo install bpf-linker --no-default-features --features llvm-21
+
+      # Auto-cd to project directory on shell login
+      echo 'cd ~/git/snif 2>/dev/null || true' >> ~/.profile
