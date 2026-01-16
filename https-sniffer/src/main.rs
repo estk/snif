@@ -6,9 +6,13 @@ use aya::Ebpf;
 use aya_log::EbpfLogger;
 use bytes::BytesMut;
 use clap::Parser;
-use https_sniffer_common::Data;
-use log::{debug, info, };
+use https_sniffer_common::{Data, HandshakeEvent};
+use log::{debug, info};
+use std::sync::{Arc, Mutex};
 use tokio::signal;
+
+mod collator;
+use collator::Collator;
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -19,6 +23,14 @@ struct Opt {
     /// Filter by foreign (remote) port (e.g., 80 for HTTP, 443 for HTTPS)
     #[clap(long)]
     port: Option<u16>,
+
+    /// Collate events into complete request/response exchanges
+    #[clap(long)]
+    collate: bool,
+
+    /// Show raw events (even when collating)
+    #[clap(long)]
+    raw: bool,
 }
 
 const OPEN_SSL_PATH: &str = "/lib/aarch64-linux-gnu/libssl.so.3";
@@ -42,6 +54,15 @@ fn attach_openssl(bpf: &mut Ebpf, opt: &Opt) -> Result<(), anyhow::Error> {
     let p_read_ret: &mut UProbe = bpf.program_mut("ssl_read_ret").unwrap().try_into()?;
     p_read_ret.load()?;
     p_read_ret.attach("SSL_read", OPEN_SSL_PATH, opt.pid)?;
+
+    // Attach uprobe and uretprobe to SSL_do_handshake for timing
+    let p_hs: &mut UProbe = bpf.program_mut("ssl_do_handshake").unwrap().try_into()?;
+    p_hs.load()?;
+    p_hs.attach("SSL_do_handshake", OPEN_SSL_PATH, opt.pid)?;
+
+    let p_hs_ret: &mut UProbe = bpf.program_mut("ssl_do_handshake_ret").unwrap().try_into()?;
+    p_hs_ret.load()?;
+    p_hs_ret.attach("SSL_do_handshake", OPEN_SSL_PATH, opt.pid)?;
 
     Ok(())
 }
@@ -128,16 +149,25 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Retrieve the perf event array from the BPF program to read events from it.
     let mut perf_array = PerfEventArray::try_from(bpf.take_map("EVENTS").unwrap())?;
+    let mut handshake_perf_array = PerfEventArray::try_from(bpf.take_map("HANDSHAKE_EVENTS").unwrap())?;
 
     // Calculate the size of the Data structure in bytes.
     let len_of_data = std::mem::size_of::<Data>();
+    let len_of_handshake = std::mem::size_of::<HandshakeEvent>();
     let port_filter = opt.port;
+    let collate = opt.collate;
+    let show_raw = opt.raw;
+
+    // Create shared collator for request/response assembly
+    let collator = Arc::new(Mutex::new(Collator::new()));
 
     // Iterate over each online CPU core. For eBPF applications, processing is often done per CPU core.
     for cpu_id in online_cpus().map_err(|(_, error)| error)? {
         // open a separate perf buffer for each cpu
         let buf = perf_array.open(cpu_id, Some(32))?;
         let mut buf = tokio::io::unix::AsyncFd::with_interest(buf, tokio::io::Interest::READABLE)?;
+
+        let collator_clone = collator.clone();
 
         // process each perf buffer in a separate task
         tokio::spawn(async move {
@@ -165,7 +195,40 @@ async fn main() -> Result<(), anyhow::Error> {
                         }
                     }
 
-                    info!("{}", data_ref);
+                    // Show raw events if not collating or if --raw flag is set
+                    if !collate || show_raw {
+                        info!("{}", data_ref);
+                    }
+
+                    // Add to collator and check for complete exchange
+                    if collate {
+                        let mut coll = collator_clone.lock().unwrap();
+                        if let Some(exchange) = coll.add_event(data_ref) {
+                            info!("\n{}", exchange);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Open handshake events perf buffer for this CPU
+        let hs_buf = handshake_perf_array.open(cpu_id, Some(32))?;
+        let mut hs_buf = tokio::io::unix::AsyncFd::with_interest(hs_buf, tokio::io::Interest::READABLE)?;
+
+        tokio::spawn(async move {
+            let mut buffers = (0..10)
+                .map(|_| BytesMut::with_capacity(len_of_handshake))
+                .collect::<Vec<_>>();
+
+            loop {
+                let mut guard = hs_buf.readable_mut().await.unwrap();
+                let Events { read, lost: _ } =
+                    guard.get_inner_mut().read_events(&mut buffers).unwrap();
+
+                for buf in buffers.iter_mut().take(read) {
+                    let event = buf.as_ptr() as *const HandshakeEvent;
+                    let event_ref = unsafe { &*event };
+                    info!("{}", event_ref);
                 }
             }
         });

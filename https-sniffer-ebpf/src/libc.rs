@@ -3,7 +3,7 @@ use aya_ebpf::{
     cty::c_void,
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task,
-        generated::bpf_probe_read_kernel, generated::bpf_probe_read_user,
+        generated::{bpf_ktime_get_ns, bpf_probe_read_kernel, bpf_probe_read_user},
     },
     macros::{uprobe, uretprobe},
     programs::ProbeContext,
@@ -92,7 +92,9 @@ fn try_libc_entry(ctx: ProbeContext) -> Result<u32, u32> {
     // For libc functions: arg 0 is fd, arg 1 is buffer
     let fd: i32 = ctx.arg(0).ok_or(0_u32)?;
     let buf_p: *const u8 = ctx.arg(1).ok_or(0_u32)?;
-    let entry = EntryData { buf_p, fd };
+    // Capture entry timestamp for latency measurement
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    let entry = EntryData { buf_p, fd, timestamp_ns };
     unsafe { BUFFERS.insert(&tgid, &entry, 0).map_err(|e| e as u8)? };
     Ok(0)
 }
@@ -315,6 +317,12 @@ fn try_libc_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
         return Ok(0);
     }
 
+    // Set connection tracking fields
+    data.timestamp_ns = entry.timestamp_ns;
+    data.tgid = tgid;
+    // Connection ID: combine tgid and port for basic correlation
+    data.conn_id = ((tgid as u64) << 32) | (data.port as u64);
+    data._pad = 0;
     data.comm = bpf_get_current_comm().map_err(|e| e as u32)?;
 
     let buffer_limit = if retval > MAX_BUF_SIZE as i32 {

@@ -10,6 +10,7 @@ pub enum Kind {
     SslWrite = 1,
     SocketRead = 2,
     SocketWrite = 3,
+    SslHandshake = 4,
 }
 
 #[repr(C)]
@@ -17,9 +18,25 @@ pub enum Kind {
 pub struct Data {
     pub kind: Kind,
     pub len: i32,
+    pub conn_id: u64,        // Connection identifier (hash of pid + ports)
+    pub timestamp_ns: u64,   // Kernel timestamp from bpf_ktime_get_ns()
+    pub tgid: u32,           // Process ID for connection tracking
+    pub port: u16,           // Foreign (remote) port, 0 if unknown
+    pub _pad: u16,           // Padding for alignment
     pub buf: [u8; MAX_BUF_SIZE],
     pub comm: [u8; TASK_COMM_LEN],
-    pub port: u16,  // Foreign (remote) port, 0 if unknown
+}
+
+/// Handshake event data - emitted when SSL_do_handshake completes
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandshakeEvent {
+    pub kind: Kind,              // Always SslHandshake
+    pub success: i32,            // 1 if handshake succeeded, 0 or negative if failed
+    pub duration_ns: u64,        // Time spent in handshake
+    pub tgid: u32,               // Process ID
+    pub _pad: u32,               // Padding for alignment
+    pub comm: [u8; TASK_COMM_LEN],
 }
 
 #[cfg(feature = "user")]
@@ -146,6 +163,7 @@ impl std::fmt::Display for Data {
             Kind::SslWrite => "SSL Write",
             Kind::SocketRead => "Socket Read",
             Kind::SocketWrite => "Socket Write",
+            Kind::SslHandshake => "SSL Handshake",
         };
 
         let port_str = if self.port > 0 {
@@ -165,6 +183,21 @@ impl std::fmt::Display for Data {
             f,
             "Kind: {}, Port: {}, Length: {}, Command: {}, Data: {}",
             kind_str, port_str, self.len, comm_str, data_str
+        )
+    }
+}
+
+#[cfg(feature = "user")]
+impl std::fmt::Display for HandshakeEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let comm_str = String::from_utf8_lossy(&self.comm);
+        let status = if self.success > 0 { "success" } else { "failed" };
+        let duration_ms = self.duration_ns as f64 / 1_000_000.0;
+
+        write!(
+            f,
+            "SSL Handshake: {}, Duration: {:.2}ms, PID: {}, Command: {}",
+            status, duration_ms, self.tgid, comm_str
         )
     }
 }
