@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use https_sniffer_common::{Data, Kind, MAX_BUF_SIZE};
 use hpack::Decoder;
 
@@ -51,23 +52,20 @@ impl Connection {
 /// A complete HTTP request
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
-    pub method: String,
-    pub path: String,
-    pub headers: HashMap<String, String>,
+    pub method: Method,
+    pub uri: Uri,
+    pub headers: HeaderMap,
     pub body: Vec<u8>,
     pub timestamp_ns: u64,
-    pub raw: Vec<u8>,
 }
 
 /// A complete HTTP response
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
-    pub status_code: u16,
-    pub status_text: String,
-    pub headers: HashMap<String, String>,
+    pub status: StatusCode,
+    pub headers: HeaderMap,
     pub body: Vec<u8>,
     pub timestamp_ns: u64,
-    pub raw: Vec<u8>,
 }
 
 /// A complete request/response exchange
@@ -94,9 +92,9 @@ impl std::fmt::Display for Exchange {
         writeln!(f, "Latency: {:.2}ms", latency_ms)?;
         writeln!(f)?;
         writeln!(f, "--- Request ---")?;
-        writeln!(f, "{} {}", self.request.method, self.request.path)?;
+        writeln!(f, "{} {}", self.request.method, self.request.uri)?;
         for (key, value) in &self.request.headers {
-            writeln!(f, "{}: {}", key, value)?;
+            writeln!(f, "{}: {}", key, value.to_str().unwrap_or("<binary>"))?;
         }
         if !self.request.body.is_empty() {
             writeln!(f)?;
@@ -104,9 +102,10 @@ impl std::fmt::Display for Exchange {
         }
         writeln!(f)?;
         writeln!(f, "--- Response ---")?;
-        writeln!(f, "{} {}", self.response.status_code, self.response.status_text)?;
+        let reason = self.response.status.canonical_reason().unwrap_or("");
+        writeln!(f, "{} {}", self.response.status.as_u16(), reason)?;
         for (key, value) in &self.response.headers {
-            writeln!(f, "{}: {}", key, value)?;
+            writeln!(f, "{}: {}", key, value.to_str().unwrap_or("<binary>"))?;
         }
         if !self.response.body.is_empty() {
             writeln!(f)?;
@@ -425,72 +424,69 @@ fn build_exchange(conn: &Connection) -> Option<Exchange> {
 }
 
 fn parse_http1_request(data: &[u8], timestamp_ns: u64) -> Option<HttpRequest> {
-    let s = std::str::from_utf8(data).ok()?;
-    let header_end = s.find("\r\n\r\n")?;
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
 
-    let headers_str = &s[..header_end];
-    let body = data[header_end + 4..].to_vec();
+    let body_offset = match req.parse(data) {
+        Ok(httparse::Status::Complete(len)) => len,
+        _ => return None,
+    };
 
-    let mut lines = headers_str.lines();
-    let request_line = lines.next()?;
-    let mut parts = request_line.split_whitespace();
+    let method = Method::from_bytes(req.method?.as_bytes()).ok()?;
+    let uri: Uri = req.path?.parse().ok()?;
 
-    let method = parts.next()?.to_string();
-    let path = parts.next()?.to_string();
-
-    let mut headers = HashMap::new();
-    for line in lines {
-        if let Some((key, value)) = line.split_once(':') {
-            headers.insert(key.trim().to_string(), value.trim().to_string());
+    let mut header_map = HeaderMap::new();
+    for h in req.headers.iter() {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(h.name.as_bytes()),
+            HeaderValue::from_bytes(h.value),
+        ) {
+            header_map.insert(name, value);
         }
     }
 
     Some(HttpRequest {
         method,
-        path,
-        headers,
-        body,
+        uri,
+        headers: header_map,
+        body: data[body_offset..].to_vec(),
         timestamp_ns,
-        raw: data.to_vec(),
     })
 }
 
 fn parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> {
-    let s = std::str::from_utf8(data).ok()?;
-    let header_end = s.find("\r\n\r\n")?;
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut res = httparse::Response::new(&mut headers);
 
-    let headers_str = &s[..header_end];
-    let body = data[header_end + 4..].to_vec();
+    let body_offset = match res.parse(data) {
+        Ok(httparse::Status::Complete(len)) => len,
+        _ => return None,
+    };
 
-    let mut lines = headers_str.lines();
-    let status_line = lines.next()?;
-    let mut parts = status_line.split_whitespace();
+    let status = StatusCode::from_u16(res.code?).ok()?;
 
-    let _version = parts.next()?;
-    let status_code: u16 = parts.next()?.parse().ok()?;
-    let status_text: String = parts.collect::<Vec<_>>().join(" ");
-
-    let mut headers = HashMap::new();
-    for line in lines {
-        if let Some((key, value)) = line.split_once(':') {
-            headers.insert(key.trim().to_string(), value.trim().to_string());
+    let mut header_map = HeaderMap::new();
+    for h in res.headers.iter() {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(h.name.as_bytes()),
+            HeaderValue::from_bytes(h.value),
+        ) {
+            header_map.insert(name, value);
         }
     }
 
     Some(HttpResponse {
-        status_code,
-        status_text,
-        headers,
-        body,
+        status,
+        headers: header_map,
+        body: data[body_offset..].to_vec(),
         timestamp_ns,
-        raw: data.to_vec(),
     })
 }
 
 fn parse_http2_request(data: &[u8], timestamp_ns: u64) -> Option<HttpRequest> {
-    let mut method = String::from("?");
-    let mut path = String::from("?");
-    let mut headers = HashMap::new();
+    let mut method = Method::GET;
+    let mut uri: Uri = "/".parse().ok()?;
+    let mut header_map = HeaderMap::new();
 
     // Try to decode HPACK headers
     let header_blocks = extract_http2_header_blocks(data);
@@ -499,44 +495,55 @@ fn parse_http2_request(data: &[u8], timestamp_ns: u64) -> Option<HttpRequest> {
         for block in header_blocks {
             if let Ok(decoded_headers) = decoder.decode(&block) {
                 for (name, value) in decoded_headers {
-                    let name_str = String::from_utf8_lossy(&name).to_string();
-                    let value_str = String::from_utf8_lossy(&value).to_string();
+                    let name_str = String::from_utf8_lossy(&name);
+                    let value_str = String::from_utf8_lossy(&value);
 
                     // Extract pseudo-headers
-                    match name_str.as_str() {
-                        ":method" => method = value_str.clone(),
-                        ":path" => path = value_str.clone(),
-                        ":authority" => { headers.insert("Host".to_string(), value_str); continue; }
-                        ":scheme" => { headers.insert("Scheme".to_string(), value_str); continue; }
-                        _ if name_str.starts_with(':') => continue, // Skip other pseudo-headers
+                    match name_str.as_ref() {
+                        ":method" => {
+                            if let Ok(m) = Method::from_bytes(value.as_slice()) {
+                                method = m;
+                            }
+                            continue;
+                        }
+                        ":path" => {
+                            if let Ok(u) = value_str.parse() {
+                                uri = u;
+                            }
+                            continue;
+                        }
+                        ":authority" => {
+                            if let Ok(v) = HeaderValue::from_bytes(&value) {
+                                header_map.insert(http::header::HOST, v);
+                            }
+                            continue;
+                        }
+                        _ if name_str.starts_with(':') => continue,
                         _ => {}
                     }
-                    headers.insert(name_str, value_str);
+                    if let (Ok(n), Ok(v)) = (
+                        HeaderName::from_bytes(&name),
+                        HeaderValue::from_bytes(&value),
+                    ) {
+                        header_map.insert(n, v);
+                    }
                 }
             }
         }
-    }
-
-    // Add frame info for context
-    let frame_info = describe_http2_frames(data);
-    if !frame_info.is_empty() {
-        headers.insert("_frames".to_string(), frame_info);
     }
 
     Some(HttpRequest {
         method,
-        path,
-        headers,
+        uri,
+        headers: header_map,
         body: extract_http2_data_payload(data),
         timestamp_ns,
-        raw: data.to_vec(),
     })
 }
 
 fn parse_http2_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> {
-    let mut status_code: u16 = 0;
-    let mut status_text = String::new();
-    let mut headers = HashMap::new();
+    let mut status = StatusCode::OK;
+    let mut header_map = HeaderMap::new();
 
     // Try to decode HPACK headers
     let header_blocks = extract_http2_header_blocks(data);
@@ -545,51 +552,36 @@ fn parse_http2_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> 
         for block in header_blocks {
             if let Ok(decoded_headers) = decoder.decode(&block) {
                 for (name, value) in decoded_headers {
-                    let name_str = String::from_utf8_lossy(&name).to_string();
-                    let value_str = String::from_utf8_lossy(&value).to_string();
+                    let name_str = String::from_utf8_lossy(&name);
+                    let value_str = String::from_utf8_lossy(&value);
 
                     // Extract pseudo-headers
                     if name_str == ":status" {
-                        status_code = value_str.parse().unwrap_or(0);
-                        status_text = match status_code {
-                            200 => "OK".to_string(),
-                            201 => "Created".to_string(),
-                            204 => "No Content".to_string(),
-                            301 => "Moved Permanently".to_string(),
-                            302 => "Found".to_string(),
-                            304 => "Not Modified".to_string(),
-                            400 => "Bad Request".to_string(),
-                            401 => "Unauthorized".to_string(),
-                            403 => "Forbidden".to_string(),
-                            404 => "Not Found".to_string(),
-                            500 => "Internal Server Error".to_string(),
-                            502 => "Bad Gateway".to_string(),
-                            503 => "Service Unavailable".to_string(),
-                            _ => String::new(),
-                        };
+                        if let Ok(code) = value_str.parse::<u16>() {
+                            if let Ok(s) = StatusCode::from_u16(code) {
+                                status = s;
+                            }
+                        }
                         continue;
                     } else if name_str.starts_with(':') {
-                        continue; // Skip other pseudo-headers
+                        continue;
                     }
-                    headers.insert(name_str, value_str);
+                    if let (Ok(n), Ok(v)) = (
+                        HeaderName::from_bytes(&name),
+                        HeaderValue::from_bytes(&value),
+                    ) {
+                        header_map.insert(n, v);
+                    }
                 }
             }
         }
     }
 
-    // Add frame info for context
-    let frame_info = describe_http2_frames(data);
-    if !frame_info.is_empty() {
-        headers.insert("_frames".to_string(), frame_info);
-    }
-
     Some(HttpResponse {
-        status_code,
-        status_text,
-        headers,
+        status,
+        headers: header_map,
         body: extract_http2_data_payload(data),
         timestamp_ns,
-        raw: data.to_vec(),
     })
 }
 
@@ -645,50 +637,6 @@ fn extract_http2_header_blocks(data: &[u8]) -> Vec<Vec<u8>> {
     }
 
     blocks
-}
-
-fn describe_http2_frames(data: &[u8]) -> String {
-    let mut result = Vec::new();
-    let mut offset = 0;
-
-    // Skip preface if present
-    if data.starts_with(HTTP2_PREFACE) {
-        result.push("PREFACE".to_string());
-        offset = HTTP2_PREFACE.len();
-    }
-
-    while offset + 9 <= data.len() {
-        let length = ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | (data[offset + 2] as u32);
-        let frame_type = data[offset + 3];
-        let flags = data[offset + 4];
-        let stream_id = ((data[offset + 5] as u32 & 0x7F) << 24)
-            | ((data[offset + 6] as u32) << 16)
-            | ((data[offset + 7] as u32) << 8)
-            | (data[offset + 8] as u32);
-
-        let frame_name = match frame_type {
-            0x0 => "DATA",
-            0x1 => "HEADERS",
-            0x2 => "PRIORITY",
-            0x3 => "RST_STREAM",
-            0x4 => "SETTINGS",
-            0x5 => "PUSH_PROMISE",
-            0x6 => "PING",
-            0x7 => "GOAWAY",
-            0x8 => "WINDOW_UPDATE",
-            0x9 => "CONTINUATION",
-            _ => "UNKNOWN",
-        };
-
-        result.push(format!("{}(stream={},len={},flags=0x{:02x})", frame_name, stream_id, length, flags));
-        offset += 9 + length as usize;
-
-        if offset > data.len() {
-            break;
-        }
-    }
-
-    result.join(", ")
 }
 
 fn extract_http2_data_payload(data: &[u8]) -> Vec<u8> {
