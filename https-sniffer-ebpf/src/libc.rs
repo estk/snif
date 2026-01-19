@@ -200,83 +200,85 @@ unsafe fn is_inet_socket_fd(fd: i32) -> bool {
     family == AF_INET || family == AF_INET6
 }
 
-// Try to get remote port from socket fd using vmlinux types
-unsafe fn get_socket_port(fd: i32) -> u16 {
+/// Returns (remote_port, local_port) from socket fd using vmlinux types
+unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
     if fd < 0 {
-        return 0;
+        return (0, 0);
     }
 
     // Get current task
     let task = bpf_get_current_task() as *const task_struct;
     if task.is_null() {
-        return 0;
+        return (0, 0);
     }
 
     // Read task->files
     let mut files: *const files_struct = core::ptr::null();
     if read_kernel_field(&mut files, core::ptr::addr_of!((*task).files) as *const c_void) != 0 {
-        return 0;
+        return (0, 0);
     }
     if files.is_null() {
-        return 0;
+        return (0, 0);
     }
 
     // Read files->fdt
     let mut fdt: *const fdtable = core::ptr::null();
     if read_kernel_field(&mut fdt, core::ptr::addr_of!((*files).fdt) as *const c_void) != 0 {
-        return 0;
+        return (0, 0);
     }
     if fdt.is_null() {
-        return 0;
+        return (0, 0);
     }
 
     // Read fdt->fd (pointer to array of file pointers)
     let mut fd_array: *const *const file = core::ptr::null();
     if read_kernel_field(&mut fd_array, core::ptr::addr_of!((*fdt).fd) as *const c_void) != 0 {
-        return 0;
+        return (0, 0);
     }
     if fd_array.is_null() {
-        return 0;
+        return (0, 0);
     }
 
     // Read fd_array[fd] to get file*
     let mut file_ptr: *const file = core::ptr::null();
     if read_kernel_field(&mut file_ptr, fd_array.add(fd as usize) as *const c_void) != 0 {
-        return 0;
+        return (0, 0);
     }
     if file_ptr.is_null() {
-        return 0;
+        return (0, 0);
     }
 
     // Read file->private_data (socket* for socket files)
     let mut socket_ptr: *const socket = core::ptr::null();
     if read_kernel_field(&mut socket_ptr, core::ptr::addr_of!((*file_ptr).private_data) as *const c_void) != 0 {
-        return 0;
+        return (0, 0);
     }
     if socket_ptr.is_null() {
-        return 0;
+        return (0, 0);
     }
 
     // Read socket->sk
     let mut sk: *const sock = core::ptr::null();
     if read_kernel_field(&mut sk, core::ptr::addr_of!((*socket_ptr).sk) as *const c_void) != 0 {
-        return 0;
+        return (0, 0);
     }
     if sk.is_null() {
-        return 0;
+        return (0, 0);
     }
 
     // Read sk->__sk_common (sock_common is embedded, not a pointer)
     let mut sk_common: sock_common = core::mem::zeroed();
     if read_kernel_field(&mut sk_common, core::ptr::addr_of!((*sk).__sk_common) as *const c_void) != 0 {
-        return 0;
+        return (0, 0);
     }
 
-    // Access skc_dport through the union: __bindgen_anon_3.__bindgen_anon_1.skc_dport
+    // Access skc_dport (remote port) through the union: __bindgen_anon_3.__bindgen_anon_1.skc_dport
     let dport = sk_common.__bindgen_anon_3.__bindgen_anon_1.skc_dport;
+    // Access skc_num (local port) - already in host byte order
+    let local_port = sk_common.__bindgen_anon_3.__bindgen_anon_1.skc_num;
 
-    // Convert from network byte order (big endian) to host byte order
-    u16::from_be(dport)
+    // Convert remote port from network byte order (big endian) to host byte order
+    (u16::from_be(dport), local_port)
 }
 
 fn try_libc_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
@@ -308,8 +310,10 @@ fn try_libc_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
 
     data.kind = kind;
     data.len = retval;
-    // Try to get remote port from socket
-    data.port = unsafe { get_socket_port(entry.fd) };
+    // Try to get remote and local port from socket
+    let (remote_port, local_port) = unsafe { get_socket_ports(entry.fd) };
+    data.port = remote_port;
+    data.local_port = local_port;
 
     // Skip port 443 - SSL probes already capture decrypted HTTPS traffic
     if data.port == 443 {
@@ -322,7 +326,6 @@ fn try_libc_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
     data.tgid = tgid;
     // Connection ID: combine tgid and port for basic correlation
     data.conn_id = ((tgid as u64) << 32) | (data.port as u64);
-    data._pad = 0;
     data.comm = bpf_get_current_comm().map_err(|e| e as u32)?;
 
     let buffer_limit = if retval > MAX_BUF_SIZE as i32 {

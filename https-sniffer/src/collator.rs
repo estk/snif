@@ -18,6 +18,7 @@ pub enum Protocol {
 pub struct DataChunk {
     pub data: Vec<u8>,
     pub timestamp_ns: u64,
+    #[allow(dead_code)]
     pub kind: Kind,
 }
 
@@ -56,6 +57,7 @@ pub struct HttpRequest {
     pub uri: Uri,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
+    #[allow(dead_code)]
     pub timestamp_ns: u64,
 }
 
@@ -65,6 +67,7 @@ pub struct HttpResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
+    #[allow(dead_code)]
     pub timestamp_ns: u64,
 }
 
@@ -122,6 +125,7 @@ pub struct Collator {
     /// SSL connections tracked by tgid (no conn_id available)
     ssl_connections: HashMap<u32, Connection>,
     /// Connection timeout in nanoseconds (5 seconds)
+    #[allow(dead_code)]
     timeout_ns: u64,
 }
 
@@ -213,6 +217,7 @@ impl Collator {
     }
 
     /// Clean up stale connections
+    #[allow(dead_code)]
     pub fn cleanup(&mut self, current_time_ns: u64) {
         self.connections.retain(|_, conn| {
             current_time_ns - conn.last_activity_ns < self.timeout_ns

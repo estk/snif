@@ -5,8 +5,8 @@ use aya::util::online_cpus;
 use aya::Ebpf;
 use aya_log::EbpfLogger;
 use bytes::BytesMut;
-use clap::Parser;
-use https_sniffer_common::{Data, HandshakeEvent};
+use clap::{Parser, ValueEnum};
+use https_sniffer_common::{Data, HandshakeEvent, Kind};
 use log::{debug, info};
 use std::sync::{Arc, Mutex};
 use tokio::signal;
@@ -15,6 +15,17 @@ use tokio_util::sync::CancellationToken;
 
 mod collator;
 use collator::Collator;
+
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+enum Direction {
+    /// Only show incoming traffic (reads/requests to server)
+    Incoming,
+    /// Only show outgoing traffic (writes/responses from server)
+    Outgoing,
+    /// Show both incoming and outgoing traffic
+    #[default]
+    Both,
+}
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -25,6 +36,14 @@ struct Opt {
     /// Filter by foreign (remote) port (e.g., 80 for HTTP, 443 for HTTPS)
     #[clap(long)]
     port: Option<u16>,
+
+    /// Filter by local port (server's listening port)
+    #[clap(long)]
+    local_port: Option<u16>,
+
+    /// Filter by traffic direction
+    #[clap(long, value_enum, default_value = "both")]
+    direction: Direction,
 
     /// Collate events into complete request/response exchanges
     #[clap(long)]
@@ -166,6 +185,8 @@ async fn main() -> Result<(), anyhow::Error> {
     let len_of_data = std::mem::size_of::<Data>();
     let len_of_handshake = std::mem::size_of::<HandshakeEvent>();
     let port_filter = opt.port;
+    let local_port_filter = opt.local_port;
+    let direction = opt.direction;
     let collate = opt.collate;
     let show_raw = opt.raw;
 
@@ -205,12 +226,37 @@ async fn main() -> Result<(), anyhow::Error> {
                             let data = buf.as_ptr() as *const Data; // Cast the buffer pointer to a Data pointer.
                             let data_ref = unsafe { &*data };
 
-                            // Apply port filter if specified
+                            // Apply remote port filter if specified
                             if let Some(filter_port) = port_filter {
                                 // Skip if port doesn't match (port 0 means unknown, always show those)
                                 if data_ref.port != 0 && data_ref.port != filter_port {
                                     continue;
                                 }
+                            }
+
+                            // Apply local port filter if specified
+                            if let Some(filter_local) = local_port_filter {
+                                // Skip if local port doesn't match (0 means unknown, always show those)
+                                if data_ref.local_port != 0 && data_ref.local_port != filter_local {
+                                    continue;
+                                }
+                            }
+
+                            // Apply direction filter
+                            match direction {
+                                Direction::Incoming => {
+                                    // Only show reads (incoming requests to server)
+                                    if !matches!(data_ref.kind, Kind::SslRead | Kind::SocketRead) {
+                                        continue;
+                                    }
+                                }
+                                Direction::Outgoing => {
+                                    // Only show writes (outgoing responses from server)
+                                    if !matches!(data_ref.kind, Kind::SslWrite | Kind::SocketWrite) {
+                                        continue;
+                                    }
+                                }
+                                Direction::Both => {}
                             }
 
                             // Show raw events if not collating or if --raw flag is set

@@ -22,7 +22,7 @@ pub struct Data {
     pub timestamp_ns: u64,   // Kernel timestamp from bpf_ktime_get_ns()
     pub tgid: u32,           // Process ID for connection tracking
     pub port: u16,           // Foreign (remote) port, 0 if unknown
-    pub _pad: u16,           // Padding for alignment
+    pub local_port: u16,     // Local port (server's listening port), 0 if unknown
     pub buf: [u8; MAX_BUF_SIZE],
     pub comm: [u8; TASK_COMM_LEN],
 }
@@ -172,6 +172,12 @@ impl std::fmt::Display for Data {
             "unknown".to_string()
         };
 
+        let local_port_str = if self.local_port > 0 {
+            format!("{}", self.local_port)
+        } else {
+            "unknown".to_string()
+        };
+
         // Try to parse as HTTP/2 for SSL traffic
         let data_str = if matches!(self.kind, Kind::SslRead | Kind::SslWrite) && is_likely_http2(buf) {
             parse_http2_frames(buf).unwrap_or_else(|| String::from_utf8_lossy(buf).to_string())
@@ -181,8 +187,8 @@ impl std::fmt::Display for Data {
 
         write!(
             f,
-            "Kind: {}, Port: {}, Length: {}, Command: {}, Data: {}",
-            kind_str, port_str, self.len, comm_str, data_str
+            "Kind: {}, LocalPort: {}, RemotePort: {}, Length: {}, Command: {}, Data: {}",
+            kind_str, local_port_str, port_str, self.len, comm_str, data_str
         )
     }
 }

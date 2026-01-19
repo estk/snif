@@ -126,7 +126,7 @@ fn try_ssl_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
     data.timestamp_ns = entry.timestamp_ns;
     data.tgid = tgid;
     data.port = 0; // SSL doesn't expose socket fd directly
-    data._pad = 0;
+    data.local_port = 0; // SSL doesn't expose socket fd directly
     data.comm = bpf_get_current_comm().map_err(|e| e as u32)?;
 
     // Limit the read buffer size to either the actual data size or the predefined maximum buffer size.
@@ -162,7 +162,7 @@ fn try_ssl_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
 
 // SSL_do_handshake probes for tracking TLS handshake timing
 #[uprobe]
-pub fn ssl_do_handshake(ctx: ProbeContext) -> u32 {
+pub fn ssl_do_handshake(_ctx: ProbeContext) -> u32 {
     match try_handshake_entry() {
         Ok(ret) => ret,
         Err(ret) => ret,
