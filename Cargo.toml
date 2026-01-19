@@ -1,7 +1,7 @@
 [workspace]
-members = ["https-sniffer", "https-sniffer-common", "https-sniffer-ebpf"]
+members = ["snif", "snif-common", "snif-ebpf"]
 resolver = "2"
-default-members = ["https-sniffer", "https-sniffer-common"]
+default-members = ["snif", "snif-common"]
 
 [workspace.package]
 version = "0.0.1"
@@ -12,8 +12,8 @@ aya = { git = "https://github.com/aya-rs/aya" }
 aya-ebpf = { git = "https://github.com/aya-rs/aya" }
 aya-log = { git = "https://github.com/aya-rs/aya" }
 aya-log-ebpf = { git = "https://github.com/aya-rs/aya" }
-https-sniffer-common = { path = "./https-sniffer-common" }
+snif-common = { path = "./snif-common" }
 
-[profile.release.package.https-sniffer-ebpf]
+[profile.release.package.snif-ebpf]
 debug = 2
 codegen-units = 1

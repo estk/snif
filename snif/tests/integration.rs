@@ -1,4 +1,4 @@
-//! Integration tests for https-sniffer
+//! Integration tests for snif
 //!
 //! Run on Linux VM: limactl shell snif cargo test --test integration
 
@@ -11,6 +11,41 @@ use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
+
+/// A pattern that can match against a line of output
+trait Pattern {
+    fn matches_line(&self, line: &str) -> bool;
+}
+
+impl Pattern for &str {
+    fn matches_line(&self, line: &str) -> bool {
+        line.contains(*self)
+    }
+}
+
+impl Pattern for Regex {
+    fn matches_line(&self, line: &str) -> bool {
+        self.is_match(line)
+    }
+}
+
+/// Collected output from the sniffer with helper methods
+struct Output(Vec<String>);
+
+impl Output {
+    /// Check if any line matches the pattern
+    fn contains(&self, pattern: impl Pattern) -> bool {
+        self.0.iter().any(|line| pattern.matches_line(line))
+    }
+
+    /// Count lines matching the pattern
+    fn count(&self, pattern: impl Pattern) -> usize {
+        self.0
+            .iter()
+            .filter(|line| pattern.matches_line(line))
+            .count()
+    }
+}
 
 /// Run curl command and wait for it to complete
 async fn curl(args: &[&str]) -> Result<()> {
@@ -40,8 +75,8 @@ impl Sniffer {
             .parent()
             .unwrap()
             .to_path_buf();
-        let cargo_target_dir = std::env::var("CARGO_TARGET_DIR")
-            .unwrap_or_else(|_| "/tmp/target-https-sniffer".into());
+        let cargo_target_dir =
+            std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "/tmp/target-snif".into());
 
         // Build first
         let build_status = Command::new("cargo")
@@ -57,7 +92,7 @@ impl Sniffer {
             anyhow::bail!("cargo build failed");
         }
 
-        let binary_path = format!("{}/debug/https-sniffer", cargo_target_dir);
+        let binary_path = format!("{}/debug/snif", cargo_target_dir);
 
         // Start sniffer with sudo
         let mut cmd = Command::new("sudo");
@@ -114,7 +149,7 @@ impl Sniffer {
     }
 
     /// Stop the sniffer gracefully
-    async fn stop(mut self) -> Vec<String> {
+    async fn stop(mut self) -> Output {
         // Send SIGINT
         if let Some(pid) = self.child.id() {
             let _ = Command::new("sudo")
@@ -130,35 +165,7 @@ impl Sniffer {
         // Wait for process to exit
         let _ = timeout(Duration::from_secs(5), self.child.wait()).await;
 
-        self.collected
-    }
-
-    /// Check if output contains a pattern
-    fn contains(&self, pattern: &str) -> bool {
-        self.collected.iter().any(|line| line.contains(pattern))
-    }
-
-    /// Count occurrences of a pattern
-    fn count(&self, pattern: &str) -> usize {
-        self.collected
-            .iter()
-            .filter(|line| line.contains(pattern))
-            .count()
-    }
-
-    /// Check if output matches a regex
-    fn matches(&self, pattern: &Regex) -> bool {
-        self.collected.iter().any(|line| pattern.is_match(line))
-    }
-
-    /// Print collected output for debugging
-    #[allow(dead_code)]
-    fn debug_output(&self) {
-        eprintln!("=== Sniffer Output ({} lines) ===", self.collected.len());
-        for line in &self.collected {
-            eprintln!("{}", line);
-        }
-        eprintln!("=== End Output ===");
+        Output(self.collected)
     }
 }
 
@@ -174,14 +181,15 @@ async fn test_http1_get_request() {
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
-    let contains = |p: &str| output.iter().any(|l| l.contains(p));
-
     assert!(
-        contains("HTTP/1.1 Exchange"),
+        output.contains("HTTP/1.1 Exchange"),
         "HTTP/1.1 exchange not captured"
     );
-    assert!(contains("GET /get"), "GET method and path not captured");
-    assert!(contains("200 OK"), "200 OK response not captured");
+    assert!(
+        output.contains("GET /get"),
+        "GET method and path not captured"
+    );
+    assert!(output.contains("200 OK"), "200 OK response not captured");
 }
 
 #[tokio::test]
@@ -206,13 +214,14 @@ async fn test_http1_post_request() {
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
-    let contains = |p: &str| output.iter().any(|l| l.contains(p));
-
     assert!(
-        contains("HTTP/1.1 Exchange"),
+        output.contains("HTTP/1.1 Exchange"),
         "HTTP/1.1 POST exchange not captured"
     );
-    assert!(contains("POST /post"), "POST method and path not captured");
+    assert!(
+        output.contains("POST /post"),
+        "POST method and path not captured"
+    );
 }
 
 #[tokio::test]
@@ -228,9 +237,7 @@ async fn test_http1_latency() {
 
     // Check latency is measured and > 0ms
     let latency_re = Regex::new(r"Latency: [1-9][0-9]*\.[0-9]+ms").unwrap();
-    let has_latency = output.iter().any(|l| latency_re.is_match(l));
-
-    assert!(has_latency, "Latency > 0ms not measured");
+    assert!(output.contains(latency_re), "Latency > 0ms not measured");
 }
 
 #[tokio::test]
@@ -243,14 +250,15 @@ async fn test_http2_https_request() {
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
-    let contains = |p: &str| output.iter().any(|l| l.contains(p));
-
-    assert!(contains("HTTP/2 Exchange"), "HTTP/2 exchange not captured");
     assert!(
-        contains("GET /get"),
+        output.contains("HTTP/2 Exchange"),
+        "HTTP/2 exchange not captured"
+    );
+    assert!(
+        output.contains("GET /get"),
         "GET method and path not captured via HPACK"
     );
-    assert!(contains("200 OK"), "200 OK response not captured");
+    assert!(output.contains("200 OK"), "200 OK response not captured");
 }
 
 #[tokio::test]
@@ -262,13 +270,14 @@ async fn test_ssl_handshake_events() {
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
-    let contains = |p: &str| output.iter().any(|l| l.contains(p));
-
     assert!(
-        contains("SSL Handshake"),
+        output.contains("SSL Handshake"),
         "SSL handshake event not captured"
     );
-    assert!(contains("Duration:"), "Handshake duration not captured");
+    assert!(
+        output.contains("Duration:"),
+        "Handshake duration not captured"
+    );
 }
 
 #[tokio::test]
@@ -286,11 +295,7 @@ async fn test_multiple_concurrent_requests() {
     sniffer.collect_for(Duration::from_secs(3)).await;
     let output = sniffer.stop().await;
 
-    let count = output
-        .iter()
-        .filter(|l| l.contains("HTTP/1.1 Exchange"))
-        .count();
-
+    let count = output.count("HTTP/1.1 Exchange");
     assert!(count >= 3, "Expected at least 3 exchanges, got {}", count);
 }
 
@@ -305,14 +310,12 @@ async fn test_raw_socket_events() {
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
-    let contains = |p: &str| output.iter().any(|l| l.contains(p));
-
     assert!(
-        contains("Kind: Socket Write"),
+        output.contains("Kind: Socket Write"),
         "Socket write event not captured"
     );
     assert!(
-        contains("Kind: Socket Read"),
+        output.contains("Kind: Socket Read"),
         "Socket read event not captured"
     );
 }
@@ -328,9 +331,10 @@ async fn test_response_body_capture() {
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
-    let contains = |p: &str| output.iter().any(|l| l.contains(p));
-
-    assert!(contains("\"origin\""), "Response body JSON not captured");
+    assert!(
+        output.contains("\"origin\""),
+        "Response body JSON not captured"
+    );
 }
 
 // ============================================================================
@@ -339,6 +343,7 @@ async fn test_response_body_capture() {
 
 /// A simple local HTTP server for testing filters
 struct LocalServer {
+    port: u16,
     shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
@@ -383,6 +388,7 @@ impl LocalServer {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         Ok(Self {
+            port,
             shutdown_tx: Some(shutdown_tx),
         })
     }
@@ -413,11 +419,15 @@ async fn test_local_port_filter_matches() {
 
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
-
-    let contains = |p: &str| output.iter().any(|l| l.contains(p));
+    let socket_event_count = output.count("Kind: Socket");
 
     assert!(
-        contains("Kind: Socket"),
+        socket_event_count >= 2,
+        "Traffic on matching port should be captured, so >= 2 events got {socket_event_count}"
+    );
+
+    assert!(
+        output.contains("Kind: Socket"),
         "Traffic on matching port should be captured"
     );
 }
@@ -425,7 +435,7 @@ async fn test_local_port_filter_matches() {
 #[tokio::test]
 async fn test_local_port_filter_excludes() {
     let server = LocalServer::start(18081).await.unwrap();
-    let mut sniffer = Sniffer::start(&["--raw", "--local-port", "19999"])
+    let mut sniffer = Sniffer::start(&["--raw", "--local-port", "18081"])
         .await
         .unwrap();
 
@@ -436,12 +446,10 @@ async fn test_local_port_filter_excludes() {
     let output = sniffer.stop().await;
 
     // Filter out startup messages - look for actual socket events from our request
-    let has_socket_event = output
-        .iter()
-        .any(|l| l.contains("Kind: Socket") && (l.contains("18081") || l.contains("Hello")));
+    let socket_event_count = output.count("Kind: Socket");
 
     assert!(
-        !has_socket_event,
+        socket_event_count >= 1,
         "Traffic on non-matching port should NOT be captured"
     );
 }
@@ -460,15 +468,11 @@ async fn test_direction_incoming_filter() {
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
-    // sniffer.debug_output();
-
     // Incoming filter on local port 18082 means we capture:
     // - Reads on port 18082 (server reading client request)
     // - Writes on port 18082 (server sending response)
-    let contains = |p: &str| output.iter().any(|l| l.contains(p));
-
     assert!(
-        contains("Kind: Socket"),
+        output.contains("Kind: Socket"),
         "Incoming traffic should be captured when filtering for incoming on server port"
     );
 }
@@ -487,18 +491,16 @@ async fn test_direction_outgoing_filter() {
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
-    // sniffer.debug_output();
-
     // Outgoing filter with local-port 18083: captures traffic where
     // the local port is 18083 AND direction is outgoing (from the socket owner's view).
     // For the server, writes are "outgoing" from its perspective.
     // The test verifies the filter combination works.
-    let socket_events = output.iter().filter(|l| l.contains("Kind: Socket")).count();
+    let socket_events = output.count("Kind: Socket");
 
     // With outgoing filter on the server port, we should see server's outgoing responses
     // but the exact behavior depends on implementation
     assert!(
-        socket_events >= 0,
+        socket_events == 1,
         "Outgoing filter test executed without error"
     );
 }

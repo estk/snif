@@ -1,18 +1,18 @@
 [package]
-name = "https-sniffer-ebpf"
+name = "snif-ebpf"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 aya-ebpf.workspace = true
 aya-log-ebpf.workspace = true
-https-sniffer-common.workspace = true
+snif-common.workspace = true
 
 [build-dependencies]
 which = { version = "8.0.0", default-features = false, features = ["real-sys"] }
 
 [[bin]]
-name = "https-sniffer"
+name = "snif"
 path = "src/main.rs"
 
 [lints.rust]

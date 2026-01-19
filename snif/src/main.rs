@@ -1,13 +1,13 @@
+use aya::Ebpf;
 use aya::maps::perf::Events;
 use aya::maps::perf::PerfEventArray;
 use aya::programs::UProbe;
 use aya::util::online_cpus;
-use aya::Ebpf;
 use aya_log::EbpfLogger;
 use bytes::BytesMut;
 use clap::{Parser, ValueEnum};
-use https_sniffer_common::{Data, HandshakeEvent, Kind};
 use log::{debug, info};
+use snif_common::{Data, HandshakeEvent, Kind};
 use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::task::JoinHandle;
@@ -81,7 +81,10 @@ fn attach_openssl(bpf: &mut Ebpf, opt: &Opt) -> Result<(), anyhow::Error> {
     p_hs.load()?;
     p_hs.attach("SSL_do_handshake", OPEN_SSL_PATH, opt.pid)?;
 
-    let p_hs_ret: &mut UProbe = bpf.program_mut("ssl_do_handshake_ret").unwrap().try_into()?;
+    let p_hs_ret: &mut UProbe = bpf
+        .program_mut("ssl_do_handshake_ret")
+        .unwrap()
+        .try_into()?;
     p_hs_ret.load()?;
     p_hs_ret.attach("SSL_do_handshake", OPEN_SSL_PATH, opt.pid)?;
 
@@ -151,7 +154,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // reach for `Ebpf::load_file` instead.
     let mut bpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
-        "/https-sniffer"
+        "/snif"
     )))?;
 
     // Create cancellation token for graceful shutdown
@@ -179,7 +182,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Retrieve the perf event array from the BPF program to read events from it.
     let mut perf_array = PerfEventArray::try_from(bpf.take_map("EVENTS").unwrap())?;
-    let mut handshake_perf_array = PerfEventArray::try_from(bpf.take_map("HANDSHAKE_EVENTS").unwrap())?;
+    let mut handshake_perf_array =
+        PerfEventArray::try_from(bpf.take_map("HANDSHAKE_EVENTS").unwrap())?;
 
     // Calculate the size of the Data structure in bytes.
     let len_of_data = std::mem::size_of::<Data>();
@@ -281,7 +285,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
         // Open handshake events perf buffer for this CPU
         let hs_buf = handshake_perf_array.open(cpu_id, Some(32))?;
-        let mut hs_buf = tokio::io::unix::AsyncFd::with_interest(hs_buf, tokio::io::Interest::READABLE)?;
+        let mut hs_buf =
+            tokio::io::unix::AsyncFd::with_interest(hs_buf, tokio::io::Interest::READABLE)?;
 
         let hs_token = cancel_token.clone();
         let hs_handle = tokio::spawn(async move {

@@ -1,5 +1,5 @@
 [package]
-name = "https-sniffer-common"
+name = "snif-common"
 version.workspace = true
 edition.workspace = true
 
@@ -8,4 +8,4 @@ default = []
 user = ["aya"]
 
 [dependencies]
-aya = {workspace = true, optional = true}
+aya = { workspace = true, optional = true }

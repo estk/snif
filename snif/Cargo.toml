@@ -1,5 +1,5 @@
 [package]
-name = "https-sniffer"
+name = "snif"
 version.workspace = true
 edition.workspace = true
 
@@ -7,7 +7,7 @@ edition.workspace = true
 aya.workspace = true
 aya-log.workspace = true
 clap = { version = "4.5", features = ["derive"] }
-https-sniffer-common = { workspace = true, features = ["user"] }
+snif-common = { workspace = true, features = ["user"] }
 anyhow = "1"
 env_logger = "0.11"
 libc = "0.2"
@@ -45,11 +45,11 @@ cargo_metadata = "0.23.1"
 # Finally note that *any* usage of `artifact = ...` in *any* Cargo.toml in the workspace breaks
 # workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
 # features.
-https-sniffer-ebpf = { path = "../https-sniffer-ebpf" }
+snif-ebpf = { path = "../snif-ebpf" }
 
 [dev-dependencies]
 regex = "1"
 
 [[bin]]
-name = "https-sniffer"
+name = "snif"
 path = "src/main.rs"

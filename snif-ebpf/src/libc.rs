@@ -9,10 +9,10 @@ use aya_ebpf::{
     programs::ProbeContext,
 };
 use aya_log_ebpf::info;
-use https_sniffer_common::{Kind, MAX_BUF_SIZE};
+use snif_common::{Kind, MAX_BUF_SIZE};
 
-use crate::openssl::{EntryData, BUFFERS, EVENTS, STORAGE};
-use crate::vmlinux::{file, files_struct, fdtable, inode, sock, sock_common, socket, task_struct};
+use crate::openssl::{BUFFERS, EVENTS, EntryData, STORAGE};
+use crate::vmlinux::{fdtable, file, files_struct, inode, sock, sock_common, socket, task_struct};
 
 // S_IFMT mask and S_IFSOCK value for checking socket file type
 const S_IFMT: u16 = 0o170000;
@@ -94,7 +94,11 @@ fn try_libc_entry(ctx: ProbeContext) -> Result<u32, u32> {
     let buf_p: *const u8 = ctx.arg(1).ok_or(0_u32)?;
     // Capture entry timestamp for latency measurement
     let timestamp_ns = unsafe { bpf_ktime_get_ns() };
-    let entry = EntryData { buf_p, fd, timestamp_ns };
+    let entry = EntryData {
+        buf_p,
+        fd,
+        timestamp_ns,
+    };
     unsafe { BUFFERS.insert(&tgid, &entry, 0).map_err(|e| e as u8)? };
     Ok(0)
 }
@@ -121,7 +125,11 @@ unsafe fn is_inet_socket_fd(fd: i32) -> bool {
     }
 
     let mut files: *const files_struct = core::ptr::null();
-    if read_kernel_field(&mut files, core::ptr::addr_of!((*task).files) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut files,
+        core::ptr::addr_of!((*task).files) as *const c_void,
+    ) != 0
+    {
         return false;
     }
     if files.is_null() {
@@ -137,7 +145,11 @@ unsafe fn is_inet_socket_fd(fd: i32) -> bool {
     }
 
     let mut fd_array: *const *const file = core::ptr::null();
-    if read_kernel_field(&mut fd_array, core::ptr::addr_of!((*fdt).fd) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut fd_array,
+        core::ptr::addr_of!((*fdt).fd) as *const c_void,
+    ) != 0
+    {
         return false;
     }
     if fd_array.is_null() {
@@ -154,7 +166,11 @@ unsafe fn is_inet_socket_fd(fd: i32) -> bool {
 
     // Get the inode to check file type
     let mut inode_ptr: *const inode = core::ptr::null();
-    if read_kernel_field(&mut inode_ptr, core::ptr::addr_of!((*file_ptr).f_inode) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut inode_ptr,
+        core::ptr::addr_of!((*file_ptr).f_inode) as *const c_void,
+    ) != 0
+    {
         return false;
     }
     if inode_ptr.is_null() {
@@ -163,7 +179,11 @@ unsafe fn is_inet_socket_fd(fd: i32) -> bool {
 
     // Read i_mode to check if it's a socket
     let mut i_mode: u16 = 0;
-    if read_kernel_field(&mut i_mode, core::ptr::addr_of!((*inode_ptr).i_mode) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut i_mode,
+        core::ptr::addr_of!((*inode_ptr).i_mode) as *const c_void,
+    ) != 0
+    {
         return false;
     }
 
@@ -174,7 +194,11 @@ unsafe fn is_inet_socket_fd(fd: i32) -> bool {
     // It's a socket - now check if it's an inet socket (AF_INET or AF_INET6)
     // Get socket from file->private_data
     let mut socket_ptr: *const socket = core::ptr::null();
-    if read_kernel_field(&mut socket_ptr, core::ptr::addr_of!((*file_ptr).private_data) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut socket_ptr,
+        core::ptr::addr_of!((*file_ptr).private_data) as *const c_void,
+    ) != 0
+    {
         return false;
     }
     if socket_ptr.is_null() {
@@ -183,7 +207,11 @@ unsafe fn is_inet_socket_fd(fd: i32) -> bool {
 
     // Get sock from socket->sk
     let mut sk: *const sock = core::ptr::null();
-    if read_kernel_field(&mut sk, core::ptr::addr_of!((*socket_ptr).sk) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut sk,
+        core::ptr::addr_of!((*socket_ptr).sk) as *const c_void,
+    ) != 0
+    {
         return false;
     }
     if sk.is_null() {
@@ -192,7 +220,11 @@ unsafe fn is_inet_socket_fd(fd: i32) -> bool {
 
     // Read socket family from sk->__sk_common.skc_family
     let mut family: u16 = 0;
-    if read_kernel_field(&mut family, core::ptr::addr_of!((*sk).__sk_common.skc_family) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut family,
+        core::ptr::addr_of!((*sk).__sk_common.skc_family) as *const c_void,
+    ) != 0
+    {
         return false;
     }
 
@@ -214,7 +246,11 @@ unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
 
     // Read task->files
     let mut files: *const files_struct = core::ptr::null();
-    if read_kernel_field(&mut files, core::ptr::addr_of!((*task).files) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut files,
+        core::ptr::addr_of!((*task).files) as *const c_void,
+    ) != 0
+    {
         return (0, 0);
     }
     if files.is_null() {
@@ -232,7 +268,11 @@ unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
 
     // Read fdt->fd (pointer to array of file pointers)
     let mut fd_array: *const *const file = core::ptr::null();
-    if read_kernel_field(&mut fd_array, core::ptr::addr_of!((*fdt).fd) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut fd_array,
+        core::ptr::addr_of!((*fdt).fd) as *const c_void,
+    ) != 0
+    {
         return (0, 0);
     }
     if fd_array.is_null() {
@@ -250,7 +290,11 @@ unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
 
     // Read file->private_data (socket* for socket files)
     let mut socket_ptr: *const socket = core::ptr::null();
-    if read_kernel_field(&mut socket_ptr, core::ptr::addr_of!((*file_ptr).private_data) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut socket_ptr,
+        core::ptr::addr_of!((*file_ptr).private_data) as *const c_void,
+    ) != 0
+    {
         return (0, 0);
     }
     if socket_ptr.is_null() {
@@ -259,7 +303,11 @@ unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
 
     // Read socket->sk
     let mut sk: *const sock = core::ptr::null();
-    if read_kernel_field(&mut sk, core::ptr::addr_of!((*socket_ptr).sk) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut sk,
+        core::ptr::addr_of!((*socket_ptr).sk) as *const c_void,
+    ) != 0
+    {
         return (0, 0);
     }
     if sk.is_null() {
@@ -268,7 +316,11 @@ unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
 
     // Read sk->__sk_common (sock_common is embedded, not a pointer)
     let mut sk_common: sock_common = core::mem::zeroed();
-    if read_kernel_field(&mut sk_common, core::ptr::addr_of!((*sk).__sk_common) as *const c_void) != 0 {
+    if read_kernel_field(
+        &mut sk_common,
+        core::ptr::addr_of!((*sk).__sk_common) as *const c_void,
+    ) != 0
+    {
         return (0, 0);
     }
 

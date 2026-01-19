@@ -1,6 +1,6 @@
 use hpack::Decoder;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
-use https_sniffer_common::{Data, Kind, MAX_BUF_SIZE};
+use snif_common::{Data, Kind, MAX_BUF_SIZE};
 use std::collections::HashMap;
 
 const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

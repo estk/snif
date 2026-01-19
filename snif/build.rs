@@ -1,19 +1,16 @@
 use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
 
-const EBPF_PACKAGE_NAME: &str = "https-sniffer-ebpf";
+const EBPF_PACKAGE_NAME: &str = "snif-ebpf";
 
 fn main() -> anyhow::Result<()> {
-    let cargo_metadata::Metadata { packages, .. } =
-        cargo_metadata::MetadataCommand::new()
-            .no_deps()
-            .exec()
-            .context("MetadataCommand::exec")?;
+    let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
+        .no_deps()
+        .exec()
+        .context("MetadataCommand::exec")?;
     let ebpf_package = packages
         .into_iter()
-        .find(|cargo_metadata::Package { name, .. }| {
-            name.as_str() == EBPF_PACKAGE_NAME
-        })
+        .find(|cargo_metadata::Package { name, .. }| name.as_str() == EBPF_PACKAGE_NAME)
         .ok_or_else(|| anyhow!("{EBPF_PACKAGE_NAME} package not found"))?;
     let cargo_metadata::Package {
         name,

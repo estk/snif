@@ -10,7 +10,7 @@ use aya_ebpf::{
     programs::ProbeContext,
 };
 use aya_log_ebpf::info;
-use https_sniffer_common::{Data, HandshakeEvent, Kind, MAX_BUF_SIZE};
+use snif_common::{Data, HandshakeEvent, Kind, MAX_BUF_SIZE};
 
 // Entry data stored between uprobe entry and return
 #[repr(C)]
@@ -83,7 +83,11 @@ fn try_ssl(ctx: ProbeContext) -> Result<u32, u32> {
     // Capture entry timestamp for latency measurement
     let timestamp_ns = unsafe { bpf_ktime_get_ns() };
     // SSL functions don't expose fd directly, so we set it to -1
-    let entry = EntryData { buf_p, fd: -1, timestamp_ns };
+    let entry = EntryData {
+        buf_p,
+        fd: -1,
+        timestamp_ns,
+    };
     // Insert the entry data into the `SSL_BUFFERS` map for the current process/thread group.
     unsafe { SSL_BUFFERS.insert(&tgid, &entry, 0).map_err(|e| e as u8)? };
     Ok(0)
@@ -180,7 +184,11 @@ pub fn ssl_do_handshake_ret(ctx: RetProbeContext) -> u32 {
 fn try_handshake_entry() -> Result<u32, u32> {
     let tgid: u32 = bpf_get_current_pid_tgid() as u32;
     let start_time = unsafe { bpf_ktime_get_ns() };
-    unsafe { HANDSHAKE_START.insert(&tgid, &start_time, 0).map_err(|e| e as u8)? };
+    unsafe {
+        HANDSHAKE_START
+            .insert(&tgid, &start_time, 0)
+            .map_err(|e| e as u8)?
+    };
     Ok(0)
 }
 
