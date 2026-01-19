@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use hpack::Decoder;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use https_sniffer_common::{Data, Kind, MAX_BUF_SIZE};
-use hpack::Decoder;
+use std::collections::HashMap;
 
 const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -18,8 +18,7 @@ pub enum Protocol {
 pub struct DataChunk {
     pub data: Vec<u8>,
     pub timestamp_ns: u64,
-    #[allow(dead_code)]
-    pub kind: Kind,
+    pub _kind: Kind,
 }
 
 /// Tracks state for a single connection
@@ -57,8 +56,7 @@ pub struct HttpRequest {
     pub uri: Uri,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
-    #[allow(dead_code)]
-    pub timestamp_ns: u64,
+    pub _timestamp_ns: u64,
 }
 
 /// A complete HTTP response
@@ -67,8 +65,7 @@ pub struct HttpResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
-    #[allow(dead_code)]
-    pub timestamp_ns: u64,
+    pub _timestamp_ns: u64,
 }
 
 /// A complete request/response exchange
@@ -91,7 +88,11 @@ impl std::fmt::Display for Exchange {
         };
         let latency_ms = self.latency_ns as f64 / 1_000_000.0;
 
-        writeln!(f, "=== {} Exchange (PID: {}, Port: {}) ===", proto_str, self.tgid, self.remote_port)?;
+        writeln!(
+            f,
+            "=== {} Exchange (PID: {}, Port: {}) ===",
+            proto_str, self.tgid, self.remote_port
+        )?;
         writeln!(f, "Latency: {:.2}ms", latency_ms)?;
         writeln!(f)?;
         writeln!(f, "--- Request ---")?;
@@ -125,7 +126,6 @@ pub struct Collator {
     /// SSL connections tracked by tgid (no conn_id available)
     ssl_connections: HashMap<u32, Connection>,
     /// Connection timeout in nanoseconds (5 seconds)
-    #[allow(dead_code)]
     timeout_ns: u64,
 }
 
@@ -156,7 +156,7 @@ impl Collator {
         let chunk = DataChunk {
             data: buf.to_vec(),
             timestamp_ns: data.timestamp_ns,
-            kind: data.kind,
+            _kind: data.kind,
         };
 
         // Use conn_id for socket events, tgid for SSL events
@@ -219,12 +219,10 @@ impl Collator {
     /// Clean up stale connections
     #[allow(dead_code)]
     pub fn cleanup(&mut self, current_time_ns: u64) {
-        self.connections.retain(|_, conn| {
-            current_time_ns - conn.last_activity_ns < self.timeout_ns
-        });
-        self.ssl_connections.retain(|_, conn| {
-            current_time_ns - conn.last_activity_ns < self.timeout_ns
-        });
+        self.connections
+            .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.timeout_ns);
+        self.ssl_connections
+            .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.timeout_ns);
     }
 }
 
@@ -254,14 +252,14 @@ fn detect_protocol(data: &[u8]) -> Protocol {
 }
 
 fn is_http1_request(data: &[u8]) -> bool {
-    data.starts_with(b"GET ") ||
-    data.starts_with(b"POST ") ||
-    data.starts_with(b"PUT ") ||
-    data.starts_with(b"DELETE ") ||
-    data.starts_with(b"HEAD ") ||
-    data.starts_with(b"OPTIONS ") ||
-    data.starts_with(b"PATCH ") ||
-    data.starts_with(b"CONNECT ")
+    data.starts_with(b"GET ")
+        || data.starts_with(b"POST ")
+        || data.starts_with(b"PUT ")
+        || data.starts_with(b"DELETE ")
+        || data.starts_with(b"HEAD ")
+        || data.starts_with(b"OPTIONS ")
+        || data.starts_with(b"PATCH ")
+        || data.starts_with(b"CONNECT ")
 }
 
 fn is_http1_response(data: &[u8]) -> bool {
@@ -273,7 +271,11 @@ fn is_request_complete(conn: &Connection) -> bool {
         return false;
     }
 
-    let all_data: Vec<u8> = conn.request_chunks.iter().flat_map(|c| c.data.clone()).collect();
+    let all_data: Vec<u8> = conn
+        .request_chunks
+        .iter()
+        .flat_map(|c| c.data.clone())
+        .collect();
 
     match conn.protocol {
         Protocol::Http1 => is_http1_message_complete(&all_data),
@@ -287,7 +289,11 @@ fn is_response_complete(conn: &Connection) -> bool {
         return false;
     }
 
-    let all_data: Vec<u8> = conn.response_chunks.iter().flat_map(|c| c.data.clone()).collect();
+    let all_data: Vec<u8> = conn
+        .response_chunks
+        .iter()
+        .flat_map(|c| c.data.clone())
+        .collect();
 
     match conn.protocol {
         Protocol::Http1 => is_http1_message_complete(&all_data),
@@ -313,15 +319,19 @@ fn is_http1_message_complete(data: &[u8]) -> bool {
 
     // Check for Content-Length
     for line in headers.lines() {
-        if let Some(len_str) = line.strip_prefix("Content-Length:").or_else(|| line.strip_prefix("content-length:")) {
-            if let Ok(content_length) = len_str.trim().parse::<usize>() {
-                return body.len() >= content_length;
-            }
+        if let Some(len_str) = line
+            .strip_prefix("Content-Length:")
+            .or_else(|| line.strip_prefix("content-length:"))
+            && let Ok(content_length) = len_str.trim().parse::<usize>()
+        {
+            return body.len() >= content_length;
         }
     }
 
     // Check for Transfer-Encoding: chunked
-    if headers.contains("Transfer-Encoding: chunked") || headers.contains("transfer-encoding: chunked") {
+    if headers.contains("Transfer-Encoding: chunked")
+        || headers.contains("transfer-encoding: chunked")
+    {
         // Look for final chunk (0\r\n\r\n)
         return data.windows(5).any(|w| w == b"0\r\n\r\n");
     }
@@ -343,7 +353,9 @@ fn is_http2_request_complete(data: &[u8]) -> bool {
     let mut has_headers_end = false;
 
     while offset + 9 <= data.len() {
-        let length = ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | (data[offset + 2] as u32);
+        let length = ((data[offset] as u32) << 16)
+            | ((data[offset + 1] as u32) << 8)
+            | (data[offset + 2] as u32);
         let frame_type = data[offset + 3];
         let flags = data[offset + 4];
 
@@ -369,7 +381,9 @@ fn is_http2_response_complete(data: &[u8]) -> bool {
     let mut has_data_frame = false;
 
     while offset + 9 <= data.len() {
-        let length = ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | (data[offset + 2] as u32);
+        let length = ((data[offset] as u32) << 16)
+            | ((data[offset + 1] as u32) << 8)
+            | (data[offset + 2] as u32);
         let frame_type = data[offset + 3];
         let flags = data[offset + 4];
 
@@ -392,13 +406,29 @@ fn is_http2_response_complete(data: &[u8]) -> bool {
 }
 
 fn build_exchange(conn: &Connection) -> Option<Exchange> {
-    let request_data: Vec<u8> = conn.request_chunks.iter().flat_map(|c| c.data.clone()).collect();
-    let response_data: Vec<u8> = conn.response_chunks.iter().flat_map(|c| c.data.clone()).collect();
+    let request_data: Vec<u8> = conn
+        .request_chunks
+        .iter()
+        .flat_map(|c| c.data.clone())
+        .collect();
+    let response_data: Vec<u8> = conn
+        .response_chunks
+        .iter()
+        .flat_map(|c| c.data.clone())
+        .collect();
 
     // Use last request chunk timestamp (when request was fully sent)
     // vs first response chunk timestamp (when response started arriving)
-    let request_time = conn.request_chunks.last().map(|c| c.timestamp_ns).unwrap_or(0);
-    let response_time = conn.response_chunks.first().map(|c| c.timestamp_ns).unwrap_or(0);
+    let request_time = conn
+        .request_chunks
+        .last()
+        .map(|c| c.timestamp_ns)
+        .unwrap_or(0);
+    let response_time = conn
+        .response_chunks
+        .first()
+        .map(|c| c.timestamp_ns)
+        .unwrap_or(0);
 
     let request = match conn.protocol {
         Protocol::Http1 => parse_http1_request(&request_data, request_time)?,
@@ -412,11 +442,7 @@ fn build_exchange(conn: &Connection) -> Option<Exchange> {
         Protocol::Unknown => return None,
     };
 
-    let latency_ns = if response_time > request_time {
-        response_time - request_time
-    } else {
-        0
-    };
+    let latency_ns = response_time.saturating_sub(request_time);
 
     Some(Exchange {
         request,
@@ -455,7 +481,7 @@ fn parse_http1_request(data: &[u8], timestamp_ns: u64) -> Option<HttpRequest> {
         uri,
         headers: header_map,
         body: data[body_offset..].to_vec(),
-        timestamp_ns,
+        _timestamp_ns: timestamp_ns,
     })
 }
 
@@ -484,7 +510,7 @@ fn parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> 
         status,
         headers: header_map,
         body: data[body_offset..].to_vec(),
-        timestamp_ns,
+        _timestamp_ns: timestamp_ns,
     })
 }
 
@@ -542,7 +568,7 @@ fn parse_http2_request(data: &[u8], timestamp_ns: u64) -> Option<HttpRequest> {
         uri,
         headers: header_map,
         body: extract_http2_data_payload(data),
-        timestamp_ns,
+        _timestamp_ns: timestamp_ns,
     })
 }
 
@@ -562,10 +588,10 @@ fn parse_http2_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> 
 
                     // Extract pseudo-headers
                     if name_str == ":status" {
-                        if let Ok(code) = value_str.parse::<u16>() {
-                            if let Ok(s) = StatusCode::from_u16(code) {
-                                status = s;
-                            }
+                        if let Ok(code) = value_str.parse::<u16>()
+                            && let Ok(s) = StatusCode::from_u16(code)
+                        {
+                            status = s;
                         }
                         continue;
                     } else if name_str.starts_with(':') {
@@ -586,7 +612,7 @@ fn parse_http2_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> 
         status,
         headers: header_map,
         body: extract_http2_data_payload(data),
-        timestamp_ns,
+        _timestamp_ns: timestamp_ns,
     })
 }
 
@@ -618,13 +644,11 @@ fn extract_http2_header_blocks(data: &[u8]) -> Vec<Vec<u8>> {
             let mut payload_end = frame_end;
 
             // Handle PADDED flag (0x08) - only for HEADERS
-            if frame_type == 0x01 && (flags & 0x08) != 0 {
-                if payload_start < frame_end {
-                    let pad_length = data[payload_start] as usize;
-                    payload_start += 1;
-                    if payload_end > pad_length {
-                        payload_end -= pad_length;
-                    }
+            if frame_type == 0x01 && (flags & 0x08) != 0 && payload_start < frame_end {
+                let pad_length = data[payload_start] as usize;
+                payload_start += 1;
+                if payload_end > pad_length {
+                    payload_end -= pad_length;
                 }
             }
 
@@ -649,7 +673,9 @@ fn extract_http2_data_payload(data: &[u8]) -> Vec<u8> {
     let mut offset = 0;
 
     while offset + 9 <= data.len() {
-        let length = ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | (data[offset + 2] as u32);
+        let length = ((data[offset] as u32) << 16)
+            | ((data[offset + 1] as u32) << 8)
+            | (data[offset + 2] as u32);
         let frame_type = data[offset + 3];
 
         let frame_end = offset + 9 + length as usize;

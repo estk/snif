@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 /// Run curl command and wait for it to complete
 async fn curl(args: &[&str]) -> Result<()> {
@@ -40,8 +40,8 @@ impl Sniffer {
             .parent()
             .unwrap()
             .to_path_buf();
-        let cargo_target_dir =
-            std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "/tmp/target-https-sniffer".into());
+        let cargo_target_dir = std::env::var("CARGO_TARGET_DIR")
+            .unwrap_or_else(|_| "/tmp/target-https-sniffer".into());
 
         // Build first
         let build_status = Command::new("cargo")
@@ -167,14 +167,19 @@ async fn test_http1_get_request() {
     let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
 
     // Make HTTP/1.1 GET request using curl
-    curl(&["-s", "--http1.1", "http://httpbin.org/get"]).await.unwrap();
+    curl(&["-s", "--http1.1", "http://httpbin.org/get"])
+        .await
+        .unwrap();
 
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
     let contains = |p: &str| output.iter().any(|l| l.contains(p));
 
-    assert!(contains("HTTP/1.1 Exchange"), "HTTP/1.1 exchange not captured");
+    assert!(
+        contains("HTTP/1.1 Exchange"),
+        "HTTP/1.1 exchange not captured"
+    );
     assert!(contains("GET /get"), "GET method and path not captured");
     assert!(contains("200 OK"), "200 OK response not captured");
 }
@@ -185,18 +190,28 @@ async fn test_http1_post_request() {
 
     // Make HTTP/1.1 POST request using curl
     curl(&[
-        "-s", "--http1.1", "-X", "POST",
-        "-H", "Content-Type: application/json",
-        "-d", r#"{"test":"data"}"#,
-        "http://httpbin.org/post"
-    ]).await.unwrap();
+        "-s",
+        "--http1.1",
+        "-X",
+        "POST",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        r#"{"test":"data"}"#,
+        "http://httpbin.org/post",
+    ])
+    .await
+    .unwrap();
 
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
     let contains = |p: &str| output.iter().any(|l| l.contains(p));
 
-    assert!(contains("HTTP/1.1 Exchange"), "HTTP/1.1 POST exchange not captured");
+    assert!(
+        contains("HTTP/1.1 Exchange"),
+        "HTTP/1.1 POST exchange not captured"
+    );
     assert!(contains("POST /post"), "POST method and path not captured");
 }
 
@@ -204,7 +219,9 @@ async fn test_http1_post_request() {
 async fn test_http1_latency() {
     let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
 
-    curl(&["-s", "--http1.1", "http://httpbin.org/get"]).await.unwrap();
+    curl(&["-s", "--http1.1", "http://httpbin.org/get"])
+        .await
+        .unwrap();
 
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
@@ -229,7 +246,10 @@ async fn test_http2_https_request() {
     let contains = |p: &str| output.iter().any(|l| l.contains(p));
 
     assert!(contains("HTTP/2 Exchange"), "HTTP/2 exchange not captured");
-    assert!(contains("GET /get"), "GET method and path not captured via HPACK");
+    assert!(
+        contains("GET /get"),
+        "GET method and path not captured via HPACK"
+    );
     assert!(contains("200 OK"), "200 OK response not captured");
 }
 
@@ -244,7 +264,10 @@ async fn test_ssl_handshake_events() {
 
     let contains = |p: &str| output.iter().any(|l| l.contains(p));
 
-    assert!(contains("SSL Handshake"), "SSL handshake event not captured");
+    assert!(
+        contains("SSL Handshake"),
+        "SSL handshake event not captured"
+    );
     assert!(contains("Duration:"), "Handshake duration not captured");
 }
 
@@ -263,7 +286,10 @@ async fn test_multiple_concurrent_requests() {
     sniffer.collect_for(Duration::from_secs(3)).await;
     let output = sniffer.stop().await;
 
-    let count = output.iter().filter(|l| l.contains("HTTP/1.1 Exchange")).count();
+    let count = output
+        .iter()
+        .filter(|l| l.contains("HTTP/1.1 Exchange"))
+        .count();
 
     assert!(count >= 3, "Expected at least 3 exchanges, got {}", count);
 }
@@ -272,22 +298,32 @@ async fn test_multiple_concurrent_requests() {
 async fn test_raw_socket_events() {
     let mut sniffer = Sniffer::start(&["--raw"]).await.unwrap();
 
-    curl(&["-s", "--http1.1", "http://httpbin.org/get"]).await.unwrap();
+    curl(&["-s", "--http1.1", "http://httpbin.org/get"])
+        .await
+        .unwrap();
 
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
 
     let contains = |p: &str| output.iter().any(|l| l.contains(p));
 
-    assert!(contains("Kind: Socket Write"), "Socket write event not captured");
-    assert!(contains("Kind: Socket Read"), "Socket read event not captured");
+    assert!(
+        contains("Kind: Socket Write"),
+        "Socket write event not captured"
+    );
+    assert!(
+        contains("Kind: Socket Read"),
+        "Socket read event not captured"
+    );
 }
 
 #[tokio::test]
 async fn test_response_body_capture() {
     let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
 
-    curl(&["-s", "--http1.1", "http://httpbin.org/ip"]).await.unwrap();
+    curl(&["-s", "--http1.1", "http://httpbin.org/ip"])
+        .await
+        .unwrap();
 
     sniffer.collect_for(Duration::from_secs(2)).await;
     let output = sniffer.stop().await;
@@ -303,8 +339,6 @@ async fn test_response_body_capture() {
 
 /// A simple local HTTP server for testing filters
 struct LocalServer {
-    #[allow(dead_code)]
-    port: u16,
     shutdown_tx: Option<mpsc::Sender<()>>,
 }
 
@@ -349,7 +383,6 @@ impl LocalServer {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         Ok(Self {
-            port,
             shutdown_tx: Some(shutdown_tx),
         })
     }
@@ -403,9 +436,9 @@ async fn test_local_port_filter_excludes() {
     let output = sniffer.stop().await;
 
     // Filter out startup messages - look for actual socket events from our request
-    let has_socket_event = output.iter().any(|l| {
-        l.contains("Kind: Socket") && (l.contains("18081") || l.contains("Hello"))
-    });
+    let has_socket_event = output
+        .iter()
+        .any(|l| l.contains("Kind: Socket") && (l.contains("18081") || l.contains("Hello")));
 
     assert!(
         !has_socket_event,
@@ -416,9 +449,10 @@ async fn test_local_port_filter_excludes() {
 #[tokio::test]
 async fn test_direction_incoming_filter() {
     let server = LocalServer::start(18082).await.unwrap();
-    let mut sniffer = Sniffer::start(&["--raw", "--local-port", "18082", "--direction", "incoming"])
-        .await
-        .unwrap();
+    let mut sniffer =
+        Sniffer::start(&["--raw", "--local-port", "18082", "--direction", "incoming"])
+            .await
+            .unwrap();
 
     // Make request - the server receives incoming traffic
     curl(&["-s", "--http1.1", &server.url()]).await.unwrap();
@@ -442,9 +476,10 @@ async fn test_direction_incoming_filter() {
 #[tokio::test]
 async fn test_direction_outgoing_filter() {
     let server = LocalServer::start(18083).await.unwrap();
-    let mut sniffer = Sniffer::start(&["--raw", "--local-port", "18083", "--direction", "outgoing"])
-        .await
-        .unwrap();
+    let mut sniffer =
+        Sniffer::start(&["--raw", "--local-port", "18083", "--direction", "outgoing"])
+            .await
+            .unwrap();
 
     // Make request - from curl's perspective, traffic to port 18083 is outgoing
     curl(&["-s", "--http1.1", &server.url()]).await.unwrap();
