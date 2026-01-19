@@ -10,6 +10,8 @@ use https_sniffer_common::{Data, HandshakeEvent};
 use log::{debug, info};
 use std::sync::{Arc, Mutex};
 use tokio::signal;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 mod collator;
 use collator::Collator;
@@ -133,15 +135,24 @@ async fn main() -> Result<(), anyhow::Error> {
         "/https-sniffer"
     )))?;
 
+    // Create cancellation token for graceful shutdown
+    let cancel_token = CancellationToken::new();
+
     // init logger
     let logger = EbpfLogger::init(&mut bpf).unwrap();
     let mut logger =
-        tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE).unwrap(); // Attach uprobe and uretprobe to OpenSSL.
+        tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE).unwrap();
+    let logger_token = cancel_token.clone();
     tokio::task::spawn(async move {
         loop {
-            let mut guard = logger.readable_mut().await.unwrap();
-            guard.get_inner_mut().flush();
-            guard.clear_ready();
+            tokio::select! {
+                _ = logger_token.cancelled() => break,
+                result = logger.readable_mut() => {
+                    let mut guard = result.unwrap();
+                    guard.get_inner_mut().flush();
+                    guard.clear_ready();
+                }
+            }
         }
     });
     attach_openssl(&mut bpf, &opt)?;
@@ -161,6 +172,9 @@ async fn main() -> Result<(), anyhow::Error> {
     // Create shared collator for request/response assembly
     let collator = Arc::new(Mutex::new(Collator::new()));
 
+    // Collect task handles for graceful shutdown
+    let mut task_handles: Vec<JoinHandle<()>> = Vec::new();
+
     // Iterate over each online CPU core. For eBPF applications, processing is often done per CPU core.
     for cpu_id in online_cpus().map_err(|(_, error)| error)? {
         // open a separate perf buffer for each cpu
@@ -168,9 +182,10 @@ async fn main() -> Result<(), anyhow::Error> {
         let mut buf = tokio::io::unix::AsyncFd::with_interest(buf, tokio::io::Interest::READABLE)?;
 
         let collator_clone = collator.clone();
+        let events_token = cancel_token.clone();
 
         // process each perf buffer in a separate task
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // Prepare a set of buffers to store the data read from the perf buffer.
             // Here, 10 buffers are created, each with a capacity equal to the size of the Data structure.
             let mut buffers = (0..10)
@@ -178,65 +193,89 @@ async fn main() -> Result<(), anyhow::Error> {
                 .collect::<Vec<_>>();
 
             loop {
-                let mut guard = buf.readable_mut().await.unwrap();
-                let Events { read, lost: _ } =
-                    guard.get_inner_mut().read_events(&mut buffers).unwrap();
+                tokio::select! {
+                    _ = events_token.cancelled() => break,
+                    result = buf.readable_mut() => {
+                        let mut guard = result.unwrap();
+                        let Events { read, lost: _ } =
+                            guard.get_inner_mut().read_events(&mut buffers).unwrap();
 
-                // Iterate over the number of events read. `events.read` indicates how many events were read.
-                for buf in buffers.iter_mut().take(read) {
-                    let data = buf.as_ptr() as *const Data; // Cast the buffer pointer to a Data pointer.
-                    let data_ref = unsafe { &*data };
+                        // Iterate over the number of events read. `events.read` indicates how many events were read.
+                        for buf in buffers.iter_mut().take(read) {
+                            let data = buf.as_ptr() as *const Data; // Cast the buffer pointer to a Data pointer.
+                            let data_ref = unsafe { &*data };
 
-                    // Apply port filter if specified
-                    if let Some(filter_port) = port_filter {
-                        // Skip if port doesn't match (port 0 means unknown, always show those)
-                        if data_ref.port != 0 && data_ref.port != filter_port {
-                            continue;
+                            // Apply port filter if specified
+                            if let Some(filter_port) = port_filter {
+                                // Skip if port doesn't match (port 0 means unknown, always show those)
+                                if data_ref.port != 0 && data_ref.port != filter_port {
+                                    continue;
+                                }
+                            }
+
+                            // Show raw events if not collating or if --raw flag is set
+                            if !collate || show_raw {
+                                info!("{}", data_ref);
+                            }
+
+                            // Add to collator and check for complete exchange
+                            if collate {
+                                let mut coll = collator_clone.lock().unwrap();
+                                if let Some(exchange) = coll.add_event(data_ref) {
+                                    info!("\n{}", exchange);
+                                }
+                            }
                         }
-                    }
-
-                    // Show raw events if not collating or if --raw flag is set
-                    if !collate || show_raw {
-                        info!("{}", data_ref);
-                    }
-
-                    // Add to collator and check for complete exchange
-                    if collate {
-                        let mut coll = collator_clone.lock().unwrap();
-                        if let Some(exchange) = coll.add_event(data_ref) {
-                            info!("\n{}", exchange);
-                        }
+                        guard.clear_ready();
                     }
                 }
             }
         });
+        task_handles.push(handle);
 
         // Open handshake events perf buffer for this CPU
         let hs_buf = handshake_perf_array.open(cpu_id, Some(32))?;
         let mut hs_buf = tokio::io::unix::AsyncFd::with_interest(hs_buf, tokio::io::Interest::READABLE)?;
 
-        tokio::spawn(async move {
+        let hs_token = cancel_token.clone();
+        let hs_handle = tokio::spawn(async move {
             let mut buffers = (0..10)
                 .map(|_| BytesMut::with_capacity(len_of_handshake))
                 .collect::<Vec<_>>();
 
             loop {
-                let mut guard = hs_buf.readable_mut().await.unwrap();
-                let Events { read, lost: _ } =
-                    guard.get_inner_mut().read_events(&mut buffers).unwrap();
+                tokio::select! {
+                    _ = hs_token.cancelled() => break,
+                    result = hs_buf.readable_mut() => {
+                        let mut guard = result.unwrap();
+                        let Events { read, lost: _ } =
+                            guard.get_inner_mut().read_events(&mut buffers).unwrap();
 
-                for buf in buffers.iter_mut().take(read) {
-                    let event = buf.as_ptr() as *const HandshakeEvent;
-                    let event_ref = unsafe { &*event };
-                    info!("{}", event_ref);
+                        for buf in buffers.iter_mut().take(read) {
+                            let event = buf.as_ptr() as *const HandshakeEvent;
+                            let event_ref = unsafe { &*event };
+                            info!("{}", event_ref);
+                        }
+                        guard.clear_ready();
+                    }
                 }
             }
         });
+        task_handles.push(hs_handle);
     }
 
     info!("Waiting for Ctrl-C...");
     signal::ctrl_c().await?;
-    info!("Exiting...");
+    info!("Shutting down...");
 
+    // Cancel all background tasks
+    cancel_token.cancel();
+
+    // Wait for all tasks to complete
+    for handle in task_handles {
+        let _ = handle.await;
+    }
+
+    info!("Exiting...");
     Ok(())
 }
