@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use https_sniffer_common::{Data, Kind, MAX_BUF_SIZE};
+use hpack::Decoder;
 
 const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
@@ -359,8 +360,9 @@ fn is_http2_request_complete(data: &[u8]) -> bool {
 }
 
 fn is_http2_response_complete(data: &[u8]) -> bool {
-    // Look for DATA frame with END_STREAM flag
+    // Look for DATA frame with END_STREAM flag, or just any DATA frame with body content
     let mut offset = 0;
+    let mut has_data_frame = false;
 
     while offset + 9 <= data.len() {
         let length = ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | (data[offset + 2] as u32);
@@ -372,17 +374,26 @@ fn is_http2_response_complete(data: &[u8]) -> bool {
             return true;
         }
 
+        // Any DATA frame with content
+        if frame_type == 0x00 && length > 0 {
+            has_data_frame = true;
+        }
+
         offset += 9 + length as usize;
     }
 
-    false
+    // If we have a DATA frame with content, consider it complete
+    // This is a heuristic for cases where END_STREAM might be in a separate event
+    has_data_frame
 }
 
 fn build_exchange(conn: &Connection) -> Option<Exchange> {
     let request_data: Vec<u8> = conn.request_chunks.iter().flat_map(|c| c.data.clone()).collect();
     let response_data: Vec<u8> = conn.response_chunks.iter().flat_map(|c| c.data.clone()).collect();
 
-    let request_time = conn.request_chunks.first().map(|c| c.timestamp_ns).unwrap_or(0);
+    // Use last request chunk timestamp (when request was fully sent)
+    // vs first response chunk timestamp (when response started arriving)
+    let request_time = conn.request_chunks.last().map(|c| c.timestamp_ns).unwrap_or(0);
     let response_time = conn.response_chunks.first().map(|c| c.timestamp_ns).unwrap_or(0);
 
     let request = match conn.protocol {
@@ -477,14 +488,45 @@ fn parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> 
 }
 
 fn parse_http2_request(data: &[u8], timestamp_ns: u64) -> Option<HttpRequest> {
-    // Simplified HTTP/2 parsing - extract method and path from HEADERS frame
-    // Full HPACK decoding would be needed for production use
+    let mut method = String::from("?");
+    let mut path = String::from("?");
+    let mut headers = HashMap::new();
 
-    // For now, create a placeholder request
+    // Try to decode HPACK headers
+    let header_blocks = extract_http2_header_blocks(data);
+    if !header_blocks.is_empty() {
+        let mut decoder = Decoder::new();
+        for block in header_blocks {
+            if let Ok(decoded_headers) = decoder.decode(&block) {
+                for (name, value) in decoded_headers {
+                    let name_str = String::from_utf8_lossy(&name).to_string();
+                    let value_str = String::from_utf8_lossy(&value).to_string();
+
+                    // Extract pseudo-headers
+                    match name_str.as_str() {
+                        ":method" => method = value_str.clone(),
+                        ":path" => path = value_str.clone(),
+                        ":authority" => { headers.insert("Host".to_string(), value_str); continue; }
+                        ":scheme" => { headers.insert("Scheme".to_string(), value_str); continue; }
+                        _ if name_str.starts_with(':') => continue, // Skip other pseudo-headers
+                        _ => {}
+                    }
+                    headers.insert(name_str, value_str);
+                }
+            }
+        }
+    }
+
+    // Add frame info for context
+    let frame_info = describe_http2_frames(data);
+    if !frame_info.is_empty() {
+        headers.insert("_frames".to_string(), frame_info);
+    }
+
     Some(HttpRequest {
-        method: "HTTP/2".to_string(),
-        path: "/".to_string(),
-        headers: HashMap::new(),
+        method,
+        path,
+        headers,
         body: extract_http2_data_payload(data),
         timestamp_ns,
         raw: data.to_vec(),
@@ -492,17 +534,161 @@ fn parse_http2_request(data: &[u8], timestamp_ns: u64) -> Option<HttpRequest> {
 }
 
 fn parse_http2_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> {
-    // Simplified HTTP/2 parsing - extract body from DATA frames
-    // Full HPACK decoding would be needed for production use
+    let mut status_code: u16 = 0;
+    let mut status_text = String::new();
+    let mut headers = HashMap::new();
+
+    // Try to decode HPACK headers
+    let header_blocks = extract_http2_header_blocks(data);
+    if !header_blocks.is_empty() {
+        let mut decoder = Decoder::new();
+        for block in header_blocks {
+            if let Ok(decoded_headers) = decoder.decode(&block) {
+                for (name, value) in decoded_headers {
+                    let name_str = String::from_utf8_lossy(&name).to_string();
+                    let value_str = String::from_utf8_lossy(&value).to_string();
+
+                    // Extract pseudo-headers
+                    if name_str == ":status" {
+                        status_code = value_str.parse().unwrap_or(0);
+                        status_text = match status_code {
+                            200 => "OK".to_string(),
+                            201 => "Created".to_string(),
+                            204 => "No Content".to_string(),
+                            301 => "Moved Permanently".to_string(),
+                            302 => "Found".to_string(),
+                            304 => "Not Modified".to_string(),
+                            400 => "Bad Request".to_string(),
+                            401 => "Unauthorized".to_string(),
+                            403 => "Forbidden".to_string(),
+                            404 => "Not Found".to_string(),
+                            500 => "Internal Server Error".to_string(),
+                            502 => "Bad Gateway".to_string(),
+                            503 => "Service Unavailable".to_string(),
+                            _ => String::new(),
+                        };
+                        continue;
+                    } else if name_str.starts_with(':') {
+                        continue; // Skip other pseudo-headers
+                    }
+                    headers.insert(name_str, value_str);
+                }
+            }
+        }
+    }
+
+    // Add frame info for context
+    let frame_info = describe_http2_frames(data);
+    if !frame_info.is_empty() {
+        headers.insert("_frames".to_string(), frame_info);
+    }
 
     Some(HttpResponse {
-        status_code: 200,
-        status_text: "OK".to_string(),
-        headers: HashMap::new(),
+        status_code,
+        status_text,
+        headers,
         body: extract_http2_data_payload(data),
         timestamp_ns,
         raw: data.to_vec(),
     })
+}
+
+/// Extract header block fragments from HEADERS and CONTINUATION frames
+fn extract_http2_header_blocks(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut blocks = Vec::new();
+    let mut offset = 0;
+
+    // Skip HTTP/2 preface if present
+    if data.starts_with(HTTP2_PREFACE) {
+        offset = HTTP2_PREFACE.len();
+    }
+
+    while offset + 9 <= data.len() {
+        let length = ((data[offset] as u32) << 16)
+            | ((data[offset + 1] as u32) << 8)
+            | (data[offset + 2] as u32);
+        let frame_type = data[offset + 3];
+        let flags = data[offset + 4];
+
+        let frame_end = offset + 9 + length as usize;
+        if frame_end > data.len() {
+            break;
+        }
+
+        // HEADERS frame (0x01) or CONTINUATION frame (0x09)
+        if frame_type == 0x01 || frame_type == 0x09 {
+            let mut payload_start = offset + 9;
+            let mut payload_end = frame_end;
+
+            // Handle PADDED flag (0x08) - only for HEADERS
+            if frame_type == 0x01 && (flags & 0x08) != 0 {
+                if payload_start < frame_end {
+                    let pad_length = data[payload_start] as usize;
+                    payload_start += 1;
+                    if payload_end > pad_length {
+                        payload_end -= pad_length;
+                    }
+                }
+            }
+
+            // Handle PRIORITY flag (0x20) - only for HEADERS
+            if frame_type == 0x01 && (flags & 0x20) != 0 {
+                payload_start += 5; // 4 bytes stream dependency + 1 byte weight
+            }
+
+            if payload_start < payload_end {
+                blocks.push(data[payload_start..payload_end].to_vec());
+            }
+        }
+
+        offset = frame_end;
+    }
+
+    blocks
+}
+
+fn describe_http2_frames(data: &[u8]) -> String {
+    let mut result = Vec::new();
+    let mut offset = 0;
+
+    // Skip preface if present
+    if data.starts_with(HTTP2_PREFACE) {
+        result.push("PREFACE".to_string());
+        offset = HTTP2_PREFACE.len();
+    }
+
+    while offset + 9 <= data.len() {
+        let length = ((data[offset] as u32) << 16) | ((data[offset + 1] as u32) << 8) | (data[offset + 2] as u32);
+        let frame_type = data[offset + 3];
+        let flags = data[offset + 4];
+        let stream_id = ((data[offset + 5] as u32 & 0x7F) << 24)
+            | ((data[offset + 6] as u32) << 16)
+            | ((data[offset + 7] as u32) << 8)
+            | (data[offset + 8] as u32);
+
+        let frame_name = match frame_type {
+            0x0 => "DATA",
+            0x1 => "HEADERS",
+            0x2 => "PRIORITY",
+            0x3 => "RST_STREAM",
+            0x4 => "SETTINGS",
+            0x5 => "PUSH_PROMISE",
+            0x6 => "PING",
+            0x7 => "GOAWAY",
+            0x8 => "WINDOW_UPDATE",
+            0x9 => "CONTINUATION",
+            _ => "UNKNOWN",
+        };
+
+        result.push(format!("{}(stream={},len={},flags=0x{:02x})", frame_name, stream_id, length, flags));
+        offset += 9 + length as usize;
+
+        if offset > data.len() {
+            break;
+        }
+    }
+
+    result.join(", ")
 }
 
 fn extract_http2_data_payload(data: &[u8]) -> Vec<u8> {
