@@ -18,6 +18,9 @@ tokio = { version = "1.49", features = [
     "rt-multi-thread",
     "net",
     "signal",
+    "process",
+    "time",
+    "io-util",
 ] }
 bytes = "1.11.0"
 hpack = "0.3"
@@ -43,6 +46,9 @@ cargo_metadata = "0.23.1"
 # workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
 # features.
 https-sniffer-ebpf = { path = "../https-sniffer-ebpf" }
+
+[dev-dependencies]
+regex = "1"
 
 [[bin]]
 name = "https-sniffer"
