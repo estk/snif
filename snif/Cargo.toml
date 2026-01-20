@@ -54,6 +54,10 @@ snif-ebpf = { path = "../snif-ebpf" }
 regex = "1"
 rstest = "0.26"
 
+[lib]
+name = "snif_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "snif"
 path = "src/main.rs"
