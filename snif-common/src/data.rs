@@ -2,6 +2,7 @@
 // https://www.openssl.org/docs/man1.1.1/man3/SSL_read.html
 pub const MAX_BUF_SIZE: usize = 16384;
 pub const TASK_COMM_LEN: usize = 16;
+pub const ADDR_SIZE: usize = 16; // IPv6 max size, IPv4 uses first 4 bytes
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,11 +19,15 @@ pub enum Kind {
 pub struct Data {
     pub kind: Kind,
     pub len: i32,
-    pub conn_id: u64,        // Connection identifier (hash of pid + ports)
-    pub timestamp_ns: u64,   // Kernel timestamp from bpf_ktime_get_ns()
-    pub tgid: u32,           // Process ID for connection tracking
-    pub port: u16,           // Foreign (remote) port, 0 if unknown
-    pub local_port: u16,     // Local port (server's listening port), 0 if unknown
+    pub conn_id: u64,                // Connection identifier (hash of pid + ports)
+    pub timestamp_ns: u64,           // Kernel timestamp from bpf_ktime_get_ns()
+    pub tgid: u32,                   // Process ID for connection tracking
+    pub peer_port: u16,              // Foreign (remote) port, 0 if unknown
+    pub local_port: u16,             // Local port (server's listening port), 0 if unknown
+    pub family: u16,                 // AF_INET (2) or AF_INET6 (10)
+    pub _padding: u16,               // Alignment
+    pub local_addr: [u8; ADDR_SIZE], // IPv4 in first 4 bytes, IPv6 all 16
+    pub peer_addr: [u8; ADDR_SIZE],  // IPv4 in first 4 bytes, IPv6 all 16
     pub buf: [u8; MAX_BUF_SIZE],
     pub comm: [u8; TASK_COMM_LEN],
 }
@@ -31,11 +36,11 @@ pub struct Data {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HandshakeEvent {
-    pub kind: Kind,              // Always SslHandshake
-    pub success: i32,            // 1 if handshake succeeded, 0 or negative if failed
-    pub duration_ns: u64,        // Time spent in handshake
-    pub tgid: u32,               // Process ID
-    pub _pad: u32,               // Padding for alignment
+    pub kind: Kind,       // Always SslHandshake
+    pub success: i32,     // 1 if handshake succeeded, 0 or negative if failed
+    pub duration_ns: u64, // Time spent in handshake
+    pub tgid: u32,        // Process ID
+    pub _pad: u32,        // Padding for alignment
     pub comm: [u8; TASK_COMM_LEN],
 }
 
@@ -132,9 +137,7 @@ fn is_likely_http2(data: &[u8]) -> bool {
         let frame_type = data[3];
         // Valid frame types are 0x0-0x9
         if frame_type <= 0x9 {
-            let length = ((data[0] as u32) << 16)
-                | ((data[1] as u32) << 8)
-                | (data[2] as u32);
+            let length = ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32);
             // Sanity check: frame length should be reasonable
             if length <= 16384 {
                 return true;
@@ -142,6 +145,30 @@ fn is_likely_http2(data: &[u8]) -> bool {
         }
     }
     false
+}
+
+#[cfg(feature = "user")]
+fn format_addr(family: u16, addr: &[u8; ADDR_SIZE]) -> String {
+    const AF_INET: u16 = 2;
+    const AF_INET6: u16 = 10;
+
+    // Check if address is all zeros
+    let is_zero = addr.iter().all(|&b| b == 0);
+    if is_zero {
+        return "unknown".to_string();
+    }
+
+    if family == AF_INET {
+        // IPv4: first 4 bytes
+        format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3])
+    } else if family == AF_INET6 {
+        // IPv6: all 16 bytes
+        use std::net::Ipv6Addr;
+        let ipv6 = Ipv6Addr::from(*addr);
+        format!("{}", ipv6)
+    } else {
+        "unknown".to_string()
+    }
 }
 
 #[cfg(feature = "user")]
@@ -166,8 +193,8 @@ impl std::fmt::Display for Data {
             Kind::SslHandshake => "SSL Handshake",
         };
 
-        let port_str = if self.port > 0 {
-            format!("{}", self.port)
+        let peer_port_str = if self.peer_port > 0 {
+            format!("{}", self.peer_port)
         } else {
             "unknown".to_string()
         };
@@ -178,17 +205,28 @@ impl std::fmt::Display for Data {
             "unknown".to_string()
         };
 
+        let local_addr_str = format_addr(self.family, &self.local_addr);
+        let peer_addr_str = format_addr(self.family, &self.peer_addr);
+
         // Try to parse as HTTP/2 for SSL traffic
-        let data_str = if matches!(self.kind, Kind::SslRead | Kind::SslWrite) && is_likely_http2(buf) {
-            parse_http2_frames(buf).unwrap_or_else(|| String::from_utf8_lossy(buf).to_string())
-        } else {
-            String::from_utf8_lossy(buf).to_string()
-        };
+        let data_str =
+            if matches!(self.kind, Kind::SslRead | Kind::SslWrite) && is_likely_http2(buf) {
+                parse_http2_frames(buf).unwrap_or_else(|| String::from_utf8_lossy(buf).to_string())
+            } else {
+                String::from_utf8_lossy(buf).to_string()
+            };
 
         write!(
             f,
-            "Kind: {}, LocalPort: {}, RemotePort: {}, Length: {}, Command: {}, Data: {}",
-            kind_str, local_port_str, port_str, self.len, comm_str, data_str
+            "Kind: {}, Local: {}:{}, Peer: {}:{}, Length: {}, Command: {}, Data: {}",
+            kind_str,
+            local_addr_str,
+            local_port_str,
+            peer_addr_str,
+            peer_port_str,
+            self.len,
+            comm_str,
+            data_str
         )
     }
 }
@@ -197,7 +235,11 @@ impl std::fmt::Display for Data {
 impl std::fmt::Display for HandshakeEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let comm_str = String::from_utf8_lossy(&self.comm);
-        let status = if self.success > 0 { "success" } else { "failed" };
+        let status = if self.success > 0 {
+            "success"
+        } else {
+            "failed"
+        };
         let duration_ms = self.duration_ns as f64 / 1_000_000.0;
 
         write!(

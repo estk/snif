@@ -5,26 +5,44 @@ use aya::programs::UProbe;
 use aya::util::online_cpus;
 use aya_log::EbpfLogger;
 use bytes::BytesMut;
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
+use glob::Pattern;
 use log::{debug, info};
-use snif_common::{Data, HandshakeEvent, Kind};
+use regex::Regex;
+use snif_common::{Data, HandshakeEvent};
 use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 mod collator;
-use collator::Collator;
+mod filter;
 
+use collator::Collator;
+use filter::{AddrFilter, Direction, Filters, PortFilter};
+
+/// CLI direction enum that maps to filter::Direction
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
-enum Direction {
+enum DirectionArg {
     /// Only show incoming traffic (reads/requests to server)
+    #[clap(alias = "in")]
     Incoming,
     /// Only show outgoing traffic (writes/responses from server)
+    #[clap(alias = "out")]
     Outgoing,
     /// Show both incoming and outgoing traffic
     #[default]
     Both,
+}
+
+impl From<DirectionArg> for Direction {
+    fn from(d: DirectionArg) -> Self {
+        match d {
+            DirectionArg::Incoming => Direction::Incoming,
+            DirectionArg::Outgoing => Direction::Outgoing,
+            DirectionArg::Both => Direction::Both,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -33,17 +51,41 @@ struct Opt {
     #[clap(short, long)]
     pid: Option<u32>,
 
-    /// Filter by foreign (remote) port (e.g., 80 for HTTP, 443 for HTTPS)
+    /// Filter by process name (glob supported, e.g., 'curl*')
     #[clap(long)]
-    port: Option<u16>,
+    process: Option<String>,
 
-    /// Filter by local port (server's listening port)
+    /// Filter by port: 443, local:443, peer:443, or comma-separated
+    #[clap(long, value_parser = parse_port_list, action = ArgAction::Append)]
+    port: Vec<Vec<PortFilter>>,
+
+    /// Filter by address: IP, CIDR, glob, or comma-separated (with optional local:/peer: prefix)
+    #[clap(long, value_parser = parse_addr_list, action = ArgAction::Append)]
+    addr: Vec<Vec<AddrFilter>>,
+
+    /// Only show events >= N bytes
     #[clap(long)]
-    local_port: Option<u16>,
+    min_size: Option<usize>,
+
+    /// Only show events <= N bytes
+    #[clap(long)]
+    max_size: Option<usize>,
+
+    /// Filter by regex pattern in payload
+    #[clap(short = 'c', long = "contains-regex")]
+    contains_regex: Option<Regex>,
+
+    /// Regex match against header lines
+    #[clap(long)]
+    header_match: Option<Regex>,
+
+    /// Match if header exists
+    #[clap(long)]
+    header_name: Option<String>,
 
     /// Filter by traffic direction
     #[clap(long, value_enum, default_value = "both")]
-    direction: Direction,
+    direction: DirectionArg,
 
     /// Collate events into complete request/response exchanges
     #[clap(long)]
@@ -52,6 +94,42 @@ struct Opt {
     /// Show raw events (even when collating)
     #[clap(long)]
     raw: bool,
+}
+
+fn parse_port_list(s: &str) -> Result<Vec<PortFilter>, String> {
+    PortFilter::parse_list(s)
+}
+
+fn parse_addr_list(s: &str) -> Result<Vec<AddrFilter>, String> {
+    AddrFilter::parse_list(s)
+}
+
+impl Opt {
+    /// Build Filters from CLI options
+    fn build_filters(&self) -> Result<Filters, String> {
+        let process = if let Some(ref p) = self.process {
+            Some(Pattern::new(p).map_err(|e| format!("invalid process pattern: {}", e))?)
+        } else {
+            None
+        };
+
+        // Flatten the nested vectors from repeated --port arguments
+        let ports: Vec<PortFilter> = self.port.iter().flatten().cloned().collect();
+        let addrs: Vec<AddrFilter> = self.addr.iter().flatten().cloned().collect();
+
+        Ok(Filters {
+            pid: self.pid,
+            process,
+            ports,
+            addrs,
+            min_size: self.min_size,
+            max_size: self.max_size,
+            contains_regex: self.contains_regex.clone(),
+            header_match: self.header_match.clone(),
+            header_name: self.header_name.clone(),
+            direction: self.direction.into(),
+        })
+    }
 }
 
 const OPEN_SSL_PATH: &str = "/lib/aarch64-linux-gnu/libssl.so.3";
@@ -185,12 +263,15 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut handshake_perf_array =
         PerfEventArray::try_from(bpf.take_map("HANDSHAKE_EVENTS").unwrap())?;
 
+    // Build filters from CLI options
+    let filters = opt
+        .build_filters()
+        .map_err(|e| anyhow::anyhow!("filter error: {}", e))?;
+    let filters = Arc::new(filters);
+
     // Calculate the size of the Data structure in bytes.
     let len_of_data = std::mem::size_of::<Data>();
     let len_of_handshake = std::mem::size_of::<HandshakeEvent>();
-    let port_filter = opt.port;
-    let local_port_filter = opt.local_port;
-    let direction = opt.direction;
     let collate = opt.collate;
     let show_raw = opt.raw;
 
@@ -208,6 +289,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
         let collator_clone = collator.clone();
         let events_token = cancel_token.clone();
+        let filters_clone = filters.clone();
 
         // process each perf buffer in a separate task
         let handle = tokio::spawn(async move {
@@ -230,37 +312,9 @@ async fn main() -> Result<(), anyhow::Error> {
                             let data = buf.as_ptr() as *const Data; // Cast the buffer pointer to a Data pointer.
                             let data_ref = unsafe { &*data };
 
-                            // Apply remote port filter if specified
-                            if let Some(filter_port) = port_filter {
-                                // Skip if port doesn't match (port 0 means unknown, always show those)
-                                if data_ref.port != 0 && data_ref.port != filter_port {
-                                    continue;
-                                }
-                            }
-
-                            // Apply local port filter if specified
-                            if let Some(filter_local) = local_port_filter {
-                                // Skip if local port doesn't match (0 means unknown, always show those)
-                                if data_ref.local_port != 0 && data_ref.local_port != filter_local {
-                                    continue;
-                                }
-                            }
-
-                            // Apply direction filter
-                            match direction {
-                                Direction::Incoming => {
-                                    // Only show reads (incoming requests to server)
-                                    if !matches!(data_ref.kind, Kind::SslRead | Kind::SocketRead) {
-                                        continue;
-                                    }
-                                }
-                                Direction::Outgoing => {
-                                    // Only show writes (outgoing responses from server)
-                                    if !matches!(data_ref.kind, Kind::SslWrite | Kind::SocketWrite) {
-                                        continue;
-                                    }
-                                }
-                                Direction::Both => {}
+                            // Apply all filters
+                            if !filters_clone.matches(data_ref) {
+                                continue;
                             }
 
                             // Show raw events if not collating or if --raw flag is set

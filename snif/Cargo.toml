@@ -27,6 +27,9 @@ hpack = "0.3"
 http = "1"
 httparse = "1"
 tokio-util = "0.7"
+ipnetwork = "0.20"
+glob = "0.3"
+regex = "1"
 
 
 [build-dependencies]
@@ -49,7 +52,7 @@ snif-ebpf = { path = "../snif-ebpf" }
 
 [dev-dependencies]
 regex = "1"
-rstest = "0.23"
+rstest = "0.26"
 
 [[bin]]
 name = "snif"

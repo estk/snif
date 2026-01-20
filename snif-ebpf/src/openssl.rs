@@ -10,7 +10,7 @@ use aya_ebpf::{
     programs::ProbeContext,
 };
 use aya_log_ebpf::info;
-use snif_common::{Data, HandshakeEvent, Kind, MAX_BUF_SIZE};
+use snif_common::{Data, HandshakeEvent, Kind, ADDR_SIZE, MAX_BUF_SIZE};
 
 // Entry data stored between uprobe entry and return
 #[repr(C)]
@@ -129,8 +129,12 @@ fn try_ssl_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
     data.conn_id = 0; // SSL doesn't expose connection info - userspace correlates by tgid+time
     data.timestamp_ns = entry.timestamp_ns;
     data.tgid = tgid;
-    data.port = 0; // SSL doesn't expose socket fd directly
+    data.peer_port = 0; // SSL doesn't expose socket fd directly
     data.local_port = 0; // SSL doesn't expose socket fd directly
+    data.family = 0; // Unknown for SSL
+    data._padding = 0;
+    data.local_addr = [0u8; ADDR_SIZE]; // SSL doesn't expose socket fd directly
+    data.peer_addr = [0u8; ADDR_SIZE]; // SSL doesn't expose socket fd directly
     data.comm = bpf_get_current_comm().map_err(|e| e as u32)?;
 
     // Limit the read buffer size to either the actual data size or the predefined maximum buffer size.

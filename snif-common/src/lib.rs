@@ -2,4 +2,4 @@
 #![cfg_attr(not(feature = "user"), no_std)]
 pub mod data;
 
-pub use data::{Data, HandshakeEvent, Kind, MAX_BUF_SIZE};
+pub use data::{Data, HandshakeEvent, Kind, ADDR_SIZE, MAX_BUF_SIZE, TASK_COMM_LEN};

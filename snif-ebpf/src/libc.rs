@@ -9,9 +9,9 @@ use aya_ebpf::{
     programs::ProbeContext,
 };
 use aya_log_ebpf::info;
-use snif_common::{Kind, MAX_BUF_SIZE};
+use snif_common::{Kind, ADDR_SIZE, MAX_BUF_SIZE};
 
-use crate::openssl::{BUFFERS, EVENTS, EntryData, STORAGE};
+use crate::openssl::{EntryData, BUFFERS, EVENTS, STORAGE};
 use crate::vmlinux::{fdtable, file, files_struct, inode, sock, sock_common, socket, task_struct};
 
 // S_IFMT mask and S_IFSOCK value for checking socket file type
@@ -232,16 +232,40 @@ unsafe fn is_inet_socket_fd(fd: i32) -> bool {
     family == AF_INET || family == AF_INET6
 }
 
-/// Returns (remote_port, local_port) from socket fd using vmlinux types
-unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
+/// Socket information extracted from kernel structures
+#[derive(Clone, Copy)]
+struct SocketInfo {
+    peer_port: u16,
+    local_port: u16,
+    family: u16,
+    local_addr: [u8; ADDR_SIZE],
+    peer_addr: [u8; ADDR_SIZE],
+}
+
+impl Default for SocketInfo {
+    fn default() -> Self {
+        Self {
+            peer_port: 0,
+            local_port: 0,
+            family: 0,
+            local_addr: [0u8; ADDR_SIZE],
+            peer_addr: [0u8; ADDR_SIZE],
+        }
+    }
+}
+
+/// Returns socket info (ports and addresses) from socket fd using vmlinux types
+unsafe fn get_socket_info(fd: i32) -> SocketInfo {
+    let mut info = SocketInfo::default();
+
     if fd < 0 {
-        return (0, 0);
+        return info;
     }
 
     // Get current task
     let task = bpf_get_current_task() as *const task_struct;
     if task.is_null() {
-        return (0, 0);
+        return info;
     }
 
     // Read task->files
@@ -251,19 +275,19 @@ unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
         core::ptr::addr_of!((*task).files) as *const c_void,
     ) != 0
     {
-        return (0, 0);
+        return info;
     }
     if files.is_null() {
-        return (0, 0);
+        return info;
     }
 
     // Read files->fdt
     let mut fdt: *const fdtable = core::ptr::null();
     if read_kernel_field(&mut fdt, core::ptr::addr_of!((*files).fdt) as *const c_void) != 0 {
-        return (0, 0);
+        return info;
     }
     if fdt.is_null() {
-        return (0, 0);
+        return info;
     }
 
     // Read fdt->fd (pointer to array of file pointers)
@@ -273,19 +297,19 @@ unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
         core::ptr::addr_of!((*fdt).fd) as *const c_void,
     ) != 0
     {
-        return (0, 0);
+        return info;
     }
     if fd_array.is_null() {
-        return (0, 0);
+        return info;
     }
 
     // Read fd_array[fd] to get file*
     let mut file_ptr: *const file = core::ptr::null();
     if read_kernel_field(&mut file_ptr, fd_array.add(fd as usize) as *const c_void) != 0 {
-        return (0, 0);
+        return info;
     }
     if file_ptr.is_null() {
-        return (0, 0);
+        return info;
     }
 
     // Read file->private_data (socket* for socket files)
@@ -295,10 +319,10 @@ unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
         core::ptr::addr_of!((*file_ptr).private_data) as *const c_void,
     ) != 0
     {
-        return (0, 0);
+        return info;
     }
     if socket_ptr.is_null() {
-        return (0, 0);
+        return info;
     }
 
     // Read socket->sk
@@ -308,10 +332,10 @@ unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
         core::ptr::addr_of!((*socket_ptr).sk) as *const c_void,
     ) != 0
     {
-        return (0, 0);
+        return info;
     }
     if sk.is_null() {
-        return (0, 0);
+        return info;
     }
 
     // Read sk->__sk_common (sock_common is embedded, not a pointer)
@@ -321,7 +345,7 @@ unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
         core::ptr::addr_of!((*sk).__sk_common) as *const c_void,
     ) != 0
     {
-        return (0, 0);
+        return info;
     }
 
     // Access skc_dport (remote port) through the union: __bindgen_anon_3.__bindgen_anon_1.skc_dport
@@ -330,7 +354,35 @@ unsafe fn get_socket_ports(fd: i32) -> (u16, u16) {
     let local_port = sk_common.__bindgen_anon_3.__bindgen_anon_1.skc_num;
 
     // Convert remote port from network byte order (big endian) to host byte order
-    (u16::from_be(dport), local_port)
+    info.peer_port = u16::from_be(dport);
+    info.local_port = local_port;
+    info.family = sk_common.skc_family;
+
+    // Extract addresses based on family
+    if sk_common.skc_family == AF_INET {
+        // IPv4: addresses are stored in __bindgen_anon_1.__bindgen_anon_1.skc_daddr/skc_rcv_saddr
+        // These are __be32, so network byte order - store as big-endian bytes
+        let peer_addr_be = sk_common.__bindgen_anon_1.__bindgen_anon_1.skc_daddr;
+        let local_addr_be = sk_common.__bindgen_anon_1.__bindgen_anon_1.skc_rcv_saddr;
+
+        // Convert to bytes manually (big-endian)
+        let peer_bytes = peer_addr_be.to_be_bytes();
+        let local_bytes = local_addr_be.to_be_bytes();
+        info.peer_addr[0] = peer_bytes[0];
+        info.peer_addr[1] = peer_bytes[1];
+        info.peer_addr[2] = peer_bytes[2];
+        info.peer_addr[3] = peer_bytes[3];
+        info.local_addr[0] = local_bytes[0];
+        info.local_addr[1] = local_bytes[1];
+        info.local_addr[2] = local_bytes[2];
+        info.local_addr[3] = local_bytes[3];
+    } else if sk_common.skc_family == AF_INET6 {
+        // IPv6: addresses are in skc_v6_daddr and skc_v6_rcv_saddr
+        info.peer_addr = sk_common.skc_v6_daddr.in6_u.u6_addr8;
+        info.local_addr = sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8;
+    }
+
+    info
 }
 
 fn try_libc_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
@@ -362,13 +414,17 @@ fn try_libc_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
 
     data.kind = kind;
     data.len = retval;
-    // Try to get remote and local port from socket
-    let (remote_port, local_port) = unsafe { get_socket_ports(entry.fd) };
-    data.port = remote_port;
-    data.local_port = local_port;
+    // Get socket info (ports and addresses)
+    let socket_info = unsafe { get_socket_info(entry.fd) };
+    data.peer_port = socket_info.peer_port;
+    data.local_port = socket_info.local_port;
+    data.family = socket_info.family;
+    data._padding = 0;
+    data.local_addr = socket_info.local_addr;
+    data.peer_addr = socket_info.peer_addr;
 
     // Skip port 443 - SSL probes already capture decrypted HTTPS traffic
-    if data.port == 443 {
+    if data.peer_port == 443 {
         unsafe { BUFFERS.remove(&tgid).ok() };
         return Ok(0);
     }
@@ -377,7 +433,7 @@ fn try_libc_ret(ctx: RetProbeContext, kind: Kind) -> Result<u32, u32> {
     data.timestamp_ns = entry.timestamp_ns;
     data.tgid = tgid;
     // Connection ID: combine tgid and port for basic correlation
-    data.conn_id = ((tgid as u64) << 32) | (data.port as u64);
+    data.conn_id = ((tgid as u64) << 32) | (data.peer_port as u64);
     data.comm = bpf_get_current_comm().map_err(|e| e as u32)?;
 
     let buffer_limit = if retval > MAX_BUF_SIZE as i32 {

@@ -379,10 +379,10 @@ impl Drop for LocalServer {
 }
 
 #[rstest]
-#[case::local_port_matches(18080, &["--raw", "--local-port", "18080"], 2, ">=")]
-#[case::local_port_filter(18081, &["--raw", "--local-port", "18081"], 1, ">=")]
-#[case::direction_incoming(18082, &["--raw", "--local-port", "18082", "--direction", "incoming"], 1, ">=")]
-#[case::direction_outgoing(18083, &["--raw", "--local-port", "18083", "--direction", "outgoing"], 1, "==")]
+#[case::local_port_matches(18080, &["--raw", "--port", "local:18080"], 2, ">=")]
+#[case::local_port_filter(18081, &["--raw", "--port", "local:18081"], 1, ">=")]
+#[case::direction_incoming(18082, &["--raw", "--port", "local:18082", "--direction", "incoming"], 1, ">=")]
+#[case::direction_outgoing(18083, &["--raw", "--port", "local:18083", "--direction", "outgoing"], 1, "==")]
 #[tokio::test]
 async fn test_filter(
     #[case] port: u16,

@@ -163,11 +163,11 @@ impl Collator {
         let conn = if data.conn_id != 0 {
             self.connections
                 .entry(data.conn_id)
-                .or_insert_with(|| Connection::new(data.tgid, data.port))
+                .or_insert_with(|| Connection::new(data.tgid, data.peer_port))
         } else {
             self.ssl_connections
                 .entry(data.tgid)
-                .or_insert_with(|| Connection::new(data.tgid, data.port))
+                .or_insert_with(|| Connection::new(data.tgid, data.peer_port))
         };
 
         conn.last_activity_ns = data.timestamp_ns;
