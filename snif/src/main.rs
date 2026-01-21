@@ -10,6 +10,7 @@ use glob::Pattern;
 use log::{debug, info};
 use regex::Regex;
 use snif_common::{Data, HandshakeEvent};
+use std::range::Range;
 use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::task::JoinHandle;
@@ -53,7 +54,7 @@ struct Opt {
 
     /// Filter by process name (glob supported, e.g., 'curl*')
     #[clap(long)]
-    process: Option<String>,
+    process_glob: Option<String>,
 
     /// Filter by port: 443, local:443, peer:443, or comma-separated
     #[clap(long, value_parser = parse_port_list, action = ArgAction::Append)]
@@ -63,24 +64,18 @@ struct Opt {
     #[clap(long, value_parser = parse_addr_list, action = ArgAction::Append)]
     addr: Vec<Vec<AddrFilter>>,
 
-    /// Only show events >= N bytes
-    #[clap(long)]
-    min_size: Option<usize>,
+    #[clap(short, long)]
+    size_bytes: Option<Range<usize>>,
 
-    /// Only show events <= N bytes
-    #[clap(long)]
-    max_size: Option<usize>,
-
-    /// Filter by regex pattern in payload
-    #[clap(short = 'c', long = "contains-regex")]
-    contains_regex: Option<Regex>,
+    #[clap(short = 'C', long)]
+    body_matches_regex: Option<Regex>,
 
     /// Regex match against header lines
-    #[clap(long)]
-    header_match: Option<Regex>,
+    #[clap(short = 'H', long)]
+    header_matches_regex: Option<Regex>,
 
     /// Match if header exists
-    #[clap(long)]
+    #[clap(short, long)]
     header_name: Option<String>,
 
     /// Filter by traffic direction
@@ -88,11 +83,11 @@ struct Opt {
     direction: DirectionArg,
 
     /// Collate events into complete request/response exchanges
-    #[clap(long)]
+    #[clap(short, long, default_value = "true")]
     collate: bool,
 
     /// Show raw events (even when collating)
-    #[clap(long)]
+    #[clap(short, long)]
     raw: bool,
 }
 
@@ -107,7 +102,7 @@ fn parse_addr_list(s: &str) -> Result<Vec<AddrFilter>, String> {
 impl Opt {
     /// Build Filters from CLI options
     fn build_filters(&self) -> Result<Filters, String> {
-        let process = if let Some(ref p) = self.process {
+        let process = if let Some(ref p) = self.process_glob {
             Some(Pattern::new(p).map_err(|e| format!("invalid process pattern: {}", e))?)
         } else {
             None
@@ -117,15 +112,22 @@ impl Opt {
         let ports: Vec<PortFilter> = self.port.iter().flatten().cloned().collect();
         let addrs: Vec<AddrFilter> = self.addr.iter().flatten().cloned().collect();
 
+        // Extract min/max from size_bytes range
+        let (min_size, max_size) = if let Some(ref range) = self.size_bytes {
+            (Some(range.start), Some(range.end))
+        } else {
+            (None, None)
+        };
+
         Ok(Filters {
             pid: self.pid,
             process,
             ports,
             addrs,
-            min_size: self.min_size,
-            max_size: self.max_size,
-            contains_regex: self.contains_regex.clone(),
-            header_match: self.header_match.clone(),
+            min_size,
+            max_size,
+            contains_regex: self.body_matches_regex.clone(),
+            header_match: self.header_matches_regex.clone(),
             header_name: self.header_name.clone(),
             direction: self.direction.into(),
         })
@@ -317,8 +319,7 @@ async fn main() -> Result<(), anyhow::Error> {
                                 continue;
                             }
 
-                            // Show raw events if not collating or if --raw flag is set
-                            if !collate || show_raw {
+                            if show_raw {
                                 info!("{}", data_ref);
                             }
 

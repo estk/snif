@@ -1,4 +1,10 @@
-## To run
+## Installation
+
+```sh
+cargo install --path ./snif
+```
+
+## Running in dev mode
 
 If not on linux, install lima then:
 
