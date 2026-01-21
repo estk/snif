@@ -10,7 +10,7 @@ use glob::Pattern;
 use log::{debug, info};
 use regex::Regex;
 use snif_common::{Data, HandshakeEvent};
-use std::range::Range;
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tokio::task::JoinHandle;
@@ -56,7 +56,7 @@ struct Opt {
     #[clap(long)]
     process_glob: Option<String>,
 
-    /// Filter by port: 443, local:80,443,8080, peer:443
+    /// Filter by port or range: 443, 80-443, local:8000-9000, peer:443
     #[clap(long, value_parser = parse_port_list, action = ArgAction::Append)]
     port: Vec<Vec<PortFilter>>,
 
@@ -64,13 +64,15 @@ struct Opt {
     #[clap(long, value_parser = parse_addr_list, action = ArgAction::Append)]
     addr: Vec<Vec<AddrFilter>>,
 
-    #[clap(short, long)]
-    size_bytes: Option<Range<usize>>,
+    /// Tests if the size of the message is within the 'min-max' range (e.g., 10-200)
+    #[clap(short, long, value_parser = parse_size_range)]
+    size_bytes: Option<RangeInclusive<usize>>,
 
+    /// Tests if the body matches this regex.
     #[clap(short = 'C', long)]
     body_matches_regex: Option<Regex>,
 
-    /// Regex match against header lines
+    /// Tests if any header matches this regex.
     #[clap(short = 'H', long)]
     header_matches_regex: Option<Regex>,
 
@@ -99,6 +101,27 @@ fn parse_addr_list(s: &str) -> Result<Vec<AddrFilter>, String> {
     AddrFilter::parse_list(s)
 }
 
+fn parse_size_range(s: &str) -> Result<RangeInclusive<usize>, String> {
+    let parts: Vec<&str> = s.split('-').collect();
+    match parts.as_slice() {
+        [min, max] => {
+            let min = min
+                .trim()
+                .parse::<usize>()
+                .map_err(|e| format!("invalid min size '{}': {}", min, e))?;
+            let max = max
+                .trim()
+                .parse::<usize>()
+                .map_err(|e| format!("invalid max size '{}': {}", max, e))?;
+            if min > max {
+                return Err(format!("min ({}) cannot be greater than max ({})", min, max));
+            }
+            Ok(min..=max)
+        }
+        _ => Err(format!("expected format 'min-max', got '{}'", s)),
+    }
+}
+
 impl Opt {
     /// Build Filters from CLI options
     fn build_filters(&self) -> Result<Filters, String> {
@@ -112,20 +135,12 @@ impl Opt {
         let ports: Vec<PortFilter> = self.port.iter().flatten().cloned().collect();
         let addrs: Vec<AddrFilter> = self.addr.iter().flatten().cloned().collect();
 
-        // Extract min/max from size_bytes range
-        let (min_size, max_size) = if let Some(ref range) = self.size_bytes {
-            (Some(range.start), Some(range.end))
-        } else {
-            (None, None)
-        };
-
         Ok(Filters {
             pid: self.pid,
             process,
             ports,
             addrs,
-            min_size,
-            max_size,
+            size_bytes: self.size_bytes.clone(),
             contains_regex: self.body_matches_regex.clone(),
             header_match: self.header_matches_regex.clone(),
             header_name: self.header_name.clone(),

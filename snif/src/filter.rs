@@ -2,7 +2,7 @@ use glob::Pattern;
 use ipnetwork::IpNetwork;
 use regex::Regex;
 use snif_common::{ADDR_SIZE, Data, Kind};
-use std::net::IpAddr;
+use std::{net::IpAddr, ops::RangeInclusive};
 
 /// Traffic direction filter
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -16,36 +16,53 @@ pub enum Direction {
     Both,
 }
 
-/// Parsed port filter value
+/// Parsed port filter value (supports single ports and ranges)
 #[derive(Clone, Debug)]
 pub enum PortFilter {
-    Either(u16),
-    Local(u16),
-    Peer(u16),
+    Either(RangeInclusive<u16>),
+    Local(RangeInclusive<u16>),
+    Peer(RangeInclusive<u16>),
 }
 
 impl PortFilter {
-    /// Parse a port number
-    fn parse_port(s: &str) -> Result<u16, String> {
-        s.trim()
-            .parse::<u16>()
-            .map_err(|e| format!("invalid port number '{}': {}", s, e))
+    /// Parse a port or port range (e.g., "443" or "80-443")
+    fn parse_port_or_range(s: &str) -> Result<RangeInclusive<u16>, String> {
+        let s = s.trim();
+        if let Some((min, max)) = s.split_once('-') {
+            let min = min
+                .trim()
+                .parse::<u16>()
+                .map_err(|e| format!("invalid port '{}': {}", min, e))?;
+            let max = max
+                .trim()
+                .parse::<u16>()
+                .map_err(|e| format!("invalid port '{}': {}", max, e))?;
+            if min > max {
+                return Err(format!("min port ({}) cannot be greater than max ({})", min, max));
+            }
+            Ok(min..=max)
+        } else {
+            let port = s
+                .parse::<u16>()
+                .map_err(|e| format!("invalid port '{}': {}", s, e))?;
+            Ok(port..=port)
+        }
     }
 
-    /// Parse comma-separated ports with optional prefix: "local:80,443,8080" or "peer:443" or "80,443"
+    /// Parse comma-separated ports/ranges with optional prefix: "local:80,443,8000-9000" or "peer:443" or "80-443"
     pub fn parse_list(s: &str) -> Result<Vec<Self>, String> {
         let s = s.trim();
         if let Some(rest) = s.strip_prefix("local:") {
             rest.split(',')
-                .map(|p| Self::parse_port(p).map(PortFilter::Local))
+                .map(|p| Self::parse_port_or_range(p).map(PortFilter::Local))
                 .collect()
         } else if let Some(rest) = s.strip_prefix("peer:") {
             rest.split(',')
-                .map(|p| Self::parse_port(p).map(PortFilter::Peer))
+                .map(|p| Self::parse_port_or_range(p).map(PortFilter::Peer))
                 .collect()
         } else {
             s.split(',')
-                .map(|p| Self::parse_port(p).map(PortFilter::Either))
+                .map(|p| Self::parse_port_or_range(p).map(PortFilter::Either))
                 .collect()
         }
     }
@@ -53,9 +70,9 @@ impl PortFilter {
     /// Check if this filter matches the given ports
     pub fn matches(&self, local_port: u16, peer_port: u16) -> bool {
         match self {
-            PortFilter::Either(port) => local_port == *port || peer_port == *port,
-            PortFilter::Local(port) => local_port == *port,
-            PortFilter::Peer(port) => peer_port == *port,
+            PortFilter::Either(range) => range.contains(&local_port) || range.contains(&peer_port),
+            PortFilter::Local(range) => range.contains(&local_port),
+            PortFilter::Peer(range) => range.contains(&peer_port),
         }
     }
 }
@@ -150,8 +167,7 @@ pub struct Filters {
     pub process: Option<Pattern>,
     pub ports: Vec<PortFilter>,
     pub addrs: Vec<AddrFilter>,
-    pub min_size: Option<usize>,
-    pub max_size: Option<usize>,
+    pub size_bytes: Option<RangeInclusive<usize>>,
     pub contains_regex: Option<Regex>,
     pub header_match: Option<Regex>,
     pub header_name: Option<String>,
@@ -165,8 +181,7 @@ impl Default for Filters {
             process: None,
             ports: Vec::new(),
             addrs: Vec::new(),
-            min_size: None,
-            max_size: None,
+            size_bytes: None,
             contains_regex: None,
             header_match: None,
             header_name: None,
@@ -262,13 +277,8 @@ impl Filters {
 
         // Size filters
         let size = data.len as usize;
-        if let Some(min) = self.min_size {
-            if size < min {
-                return false;
-            }
-        }
-        if let Some(max) = self.max_size {
-            if size > max {
+        if let Some(bytes_range) = &self.size_bytes {
+            if !bytes_range.contains(&size) {
                 return false;
             }
         }
@@ -343,15 +353,42 @@ mod tests {
     fn test_port_filter_parse_single() {
         let filters = PortFilter::parse_list("443").unwrap();
         assert_eq!(filters.len(), 1);
-        assert!(matches!(filters[0], PortFilter::Either(443)));
+        assert!(filters[0].matches(443, 0));
 
         let filters = PortFilter::parse_list("local:8080").unwrap();
         assert_eq!(filters.len(), 1);
-        assert!(matches!(filters[0], PortFilter::Local(8080)));
+        assert!(matches!(filters[0], PortFilter::Local(_)));
+        assert!(filters[0].matches(8080, 0));
 
         let filters = PortFilter::parse_list("peer:80").unwrap();
         assert_eq!(filters.len(), 1);
-        assert!(matches!(filters[0], PortFilter::Peer(80)));
+        assert!(matches!(filters[0], PortFilter::Peer(_)));
+        assert!(filters[0].matches(0, 80));
+    }
+
+    #[test]
+    fn test_port_filter_parse_range() {
+        // Single range
+        let filters = PortFilter::parse_list("80-443").unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(filters[0].matches(80, 0));
+        assert!(filters[0].matches(200, 0));
+        assert!(filters[0].matches(443, 0));
+        assert!(!filters[0].matches(444, 0));
+
+        // Range with prefix
+        let filters = PortFilter::parse_list("local:8000-9000").unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(filters[0], PortFilter::Local(_)));
+        assert!(filters[0].matches(8500, 0));
+        assert!(!filters[0].matches(0, 8500)); // peer port shouldn't match
+
+        // Mixed ports and ranges
+        let filters = PortFilter::parse_list("80,443,8000-9000").unwrap();
+        assert_eq!(filters.len(), 3);
+        assert!(filters[0].matches(80, 0));
+        assert!(filters[1].matches(443, 0));
+        assert!(filters[2].matches(8500, 0));
     }
 
     #[test]
@@ -359,28 +396,33 @@ mod tests {
         // Prefix applies to all ports in the list
         let filters = PortFilter::parse_list("local:80,443,8080").unwrap();
         assert_eq!(filters.len(), 3);
-        assert!(matches!(filters[0], PortFilter::Local(80)));
-        assert!(matches!(filters[1], PortFilter::Local(443)));
-        assert!(matches!(filters[2], PortFilter::Local(8080)));
+        assert!(matches!(filters[0], PortFilter::Local(_)));
+        assert!(matches!(filters[1], PortFilter::Local(_)));
+        assert!(matches!(filters[2], PortFilter::Local(_)));
 
         // No prefix means Either
         let filters = PortFilter::parse_list("80,443").unwrap();
         assert_eq!(filters.len(), 2);
-        assert!(matches!(filters[0], PortFilter::Either(80)));
-        assert!(matches!(filters[1], PortFilter::Either(443)));
+        assert!(matches!(filters[0], PortFilter::Either(_)));
+        assert!(matches!(filters[1], PortFilter::Either(_)));
     }
 
     #[test]
     fn test_port_filter_matches() {
-        assert!(PortFilter::Either(80).matches(80, 0));
-        assert!(PortFilter::Either(80).matches(0, 80));
-        assert!(!PortFilter::Either(80).matches(8080, 443));
+        assert!(PortFilter::Either(80..=80).matches(80, 0));
+        assert!(PortFilter::Either(80..=80).matches(0, 80));
+        assert!(!PortFilter::Either(80..=80).matches(8080, 443));
 
-        assert!(PortFilter::Local(80).matches(80, 443));
-        assert!(!PortFilter::Local(80).matches(443, 80));
+        assert!(PortFilter::Local(80..=80).matches(80, 443));
+        assert!(!PortFilter::Local(80..=80).matches(443, 80));
 
-        assert!(PortFilter::Peer(443).matches(80, 443));
-        assert!(!PortFilter::Peer(443).matches(443, 80));
+        assert!(PortFilter::Peer(443..=443).matches(80, 443));
+        assert!(!PortFilter::Peer(443..=443).matches(443, 80));
+
+        // Range matches
+        assert!(PortFilter::Either(80..=443).matches(200, 0));
+        assert!(PortFilter::Either(80..=443).matches(0, 200));
+        assert!(!PortFilter::Either(80..=443).matches(444, 500));
     }
 
     #[test]
