@@ -2,6 +2,9 @@
 
 ```sh
 cargo install --path ./snif
+
+# Then to use
+RUST_LOG=info sudo -E $(which snif) --collate
 ```
 
 ## Running in dev mode

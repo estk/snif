@@ -25,30 +25,29 @@ pub enum PortFilter {
 }
 
 impl PortFilter {
-    /// Parse a single port filter: "443", "local:443", or "peer:443"
-    pub fn parse_single(s: &str) -> Result<Self, String> {
-        let s = s.trim();
-        if let Some(rest) = s.strip_prefix("local:") {
-            let port = rest
-                .parse::<u16>()
-                .map_err(|e| format!("invalid port number '{}': {}", rest, e))?;
-            Ok(PortFilter::Local(port))
-        } else if let Some(rest) = s.strip_prefix("peer:") {
-            let port = rest
-                .parse::<u16>()
-                .map_err(|e| format!("invalid port number '{}': {}", rest, e))?;
-            Ok(PortFilter::Peer(port))
-        } else {
-            let port = s
-                .parse::<u16>()
-                .map_err(|e| format!("invalid port number '{}': {}", s, e))?;
-            Ok(PortFilter::Either(port))
-        }
+    /// Parse a port number
+    fn parse_port(s: &str) -> Result<u16, String> {
+        s.trim()
+            .parse::<u16>()
+            .map_err(|e| format!("invalid port number '{}': {}", s, e))
     }
 
-    /// Parse comma-separated port filters: "local:80,peer:443"
+    /// Parse comma-separated ports with optional prefix: "local:80,443,8080" or "peer:443" or "80,443"
     pub fn parse_list(s: &str) -> Result<Vec<Self>, String> {
-        s.split(',').map(Self::parse_single).collect()
+        let s = s.trim();
+        if let Some(rest) = s.strip_prefix("local:") {
+            rest.split(',')
+                .map(|p| Self::parse_port(p).map(PortFilter::Local))
+                .collect()
+        } else if let Some(rest) = s.strip_prefix("peer:") {
+            rest.split(',')
+                .map(|p| Self::parse_port(p).map(PortFilter::Peer))
+                .collect()
+        } else {
+            s.split(',')
+                .map(|p| Self::parse_port(p).map(PortFilter::Either))
+                .collect()
+        }
     }
 
     /// Check if this filter matches the given ports
@@ -114,24 +113,22 @@ pub enum AddrFilter {
 }
 
 impl AddrFilter {
-    /// Parse a single address filter: "10.0.0.1", "local:10.0.0.0/24", "peer:192.168.*.*"
-    pub fn parse_single(s: &str) -> Result<Self, String> {
+    /// Parse comma-separated addresses with optional prefix: "local:10.0.0.1,10.0.0.2" or "peer:192.168.*.*"
+    pub fn parse_list(s: &str) -> Result<Vec<Self>, String> {
         let s = s.trim();
         if let Some(rest) = s.strip_prefix("local:") {
-            let matcher = AddrMatcher::parse(rest)?;
-            Ok(AddrFilter::Local(matcher))
+            rest.split(',')
+                .map(|a| AddrMatcher::parse(a.trim()).map(AddrFilter::Local))
+                .collect()
         } else if let Some(rest) = s.strip_prefix("peer:") {
-            let matcher = AddrMatcher::parse(rest)?;
-            Ok(AddrFilter::Peer(matcher))
+            rest.split(',')
+                .map(|a| AddrMatcher::parse(a.trim()).map(AddrFilter::Peer))
+                .collect()
         } else {
-            let matcher = AddrMatcher::parse(s)?;
-            Ok(AddrFilter::Either(matcher))
+            s.split(',')
+                .map(|a| AddrMatcher::parse(a.trim()).map(AddrFilter::Either))
+                .collect()
         }
-    }
-
-    /// Parse comma-separated address filters: "local:127.0.0.1,peer:10.0.0.0/24"
-    pub fn parse_list(s: &str) -> Result<Vec<Self>, String> {
-        s.split(',').map(Self::parse_single).collect()
     }
 
     /// Check if this filter matches the given addresses
@@ -343,25 +340,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_port_filter_parse() {
-        assert!(matches!(
-            PortFilter::parse_single("443").unwrap(),
-            PortFilter::Either(443)
-        ));
-        assert!(matches!(
-            PortFilter::parse_single("local:8080").unwrap(),
-            PortFilter::Local(8080)
-        ));
-        assert!(matches!(
-            PortFilter::parse_single("peer:80").unwrap(),
-            PortFilter::Peer(80)
-        ));
+    fn test_port_filter_parse_single() {
+        let filters = PortFilter::parse_list("443").unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(filters[0], PortFilter::Either(443)));
+
+        let filters = PortFilter::parse_list("local:8080").unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(filters[0], PortFilter::Local(8080)));
+
+        let filters = PortFilter::parse_list("peer:80").unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(filters[0], PortFilter::Peer(80)));
     }
 
     #[test]
     fn test_port_filter_parse_list() {
-        let filters = PortFilter::parse_list("local:80,peer:443").unwrap();
+        // Prefix applies to all ports in the list
+        let filters = PortFilter::parse_list("local:80,443,8080").unwrap();
+        assert_eq!(filters.len(), 3);
+        assert!(matches!(filters[0], PortFilter::Local(80)));
+        assert!(matches!(filters[1], PortFilter::Local(443)));
+        assert!(matches!(filters[2], PortFilter::Local(8080)));
+
+        // No prefix means Either
+        let filters = PortFilter::parse_list("80,443").unwrap();
         assert_eq!(filters.len(), 2);
+        assert!(matches!(filters[0], PortFilter::Either(80)));
+        assert!(matches!(filters[1], PortFilter::Either(443)));
     }
 
     #[test]
@@ -402,17 +408,32 @@ mod tests {
 
     #[test]
     fn test_addr_filter_parse() {
-        assert!(matches!(
-            AddrFilter::parse_single("10.0.0.1").unwrap(),
-            AddrFilter::Either(_)
-        ));
-        assert!(matches!(
-            AddrFilter::parse_single("local:127.0.0.1").unwrap(),
-            AddrFilter::Local(_)
-        ));
-        assert!(matches!(
-            AddrFilter::parse_single("peer:192.168.0.0/16").unwrap(),
-            AddrFilter::Peer(_)
-        ));
+        let filters = AddrFilter::parse_list("10.0.0.1").unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(filters[0], AddrFilter::Either(_)));
+
+        let filters = AddrFilter::parse_list("local:127.0.0.1").unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(filters[0], AddrFilter::Local(_)));
+
+        let filters = AddrFilter::parse_list("peer:192.168.0.0/16").unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(filters[0], AddrFilter::Peer(_)));
+    }
+
+    #[test]
+    fn test_addr_filter_parse_list() {
+        // Prefix applies to all addresses in the list
+        let filters = AddrFilter::parse_list("local:10.0.0.1,10.0.0.2,10.0.0.3").unwrap();
+        assert_eq!(filters.len(), 3);
+        assert!(matches!(filters[0], AddrFilter::Local(_)));
+        assert!(matches!(filters[1], AddrFilter::Local(_)));
+        assert!(matches!(filters[2], AddrFilter::Local(_)));
+
+        // No prefix means Either
+        let filters = AddrFilter::parse_list("10.0.0.1,192.168.1.1").unwrap();
+        assert_eq!(filters.len(), 2);
+        assert!(matches!(filters[0], AddrFilter::Either(_)));
+        assert!(matches!(filters[1], AddrFilter::Either(_)));
     }
 }

@@ -56,11 +56,11 @@ struct Opt {
     #[clap(long)]
     process_glob: Option<String>,
 
-    /// Filter by port: 443, local:443, peer:443, or comma-separated
+    /// Filter by port: 443, local:80,443,8080, peer:443
     #[clap(long, value_parser = parse_port_list, action = ArgAction::Append)]
     port: Vec<Vec<PortFilter>>,
 
-    /// Filter by address: IP, CIDR, glob, or comma-separated (with optional local:/peer: prefix)
+    /// Filter by address: 10.0.0.1, local:10.0.0.1,10.0.0.2, peer:192.168.0.0/24
     #[clap(long, value_parser = parse_addr_list, action = ArgAction::Append)]
     addr: Vec<Vec<AddrFilter>>,
 
