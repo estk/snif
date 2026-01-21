@@ -1,4 +1,22 @@
+# Snif
+
+## Setup
+
+Provision a snif vm.
+
+```sh
+limactl start --name snif lima/snif.yml
+```
+
+Get a shell in the vm.
+
+```sh
+limactl shell snif
+```
+
 ## Installation
+
+Run the following in a 
 
 ```sh
 cargo install --path ./snif
@@ -7,15 +25,17 @@ cargo install --path ./snif
 RUST_LOG=info sudo -E $(which snif) --collate
 ```
 
-## Running in dev mode
-
-If not on linux, install lima then:
+In a separate shell
 
 ```sh
-# Start and provision a new lima instance
-limactl start --name snif lima/snif.yml
+curl http://google.com
+```
 
-# Then in the lima ssh session
+## Cargo run mode
+
+In a lima shell
+
+```sh
 RUST_LOG=info cargo run --config 'target."cfg(all())".runner="sudo -E"' -- --port 80
 ```
 
