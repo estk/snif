@@ -10,7 +10,7 @@ use aya_ebpf::{
     programs::ProbeContext,
 };
 use aya_log_ebpf::info;
-use snif_common::{Data, HandshakeEvent, Kind, ADDR_SIZE, MAX_BUF_SIZE};
+use snif_common::{ADDR_SIZE, Data, HandshakeEvent, Kind, MAX_BUF_SIZE};
 
 // Entry data stored between uprobe entry and return
 #[repr(C)]

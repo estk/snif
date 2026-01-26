@@ -38,7 +38,10 @@ impl PortFilter {
                 .parse::<u16>()
                 .map_err(|e| format!("invalid port '{}': {}", max, e))?;
             if min > max {
-                return Err(format!("min port ({}) cannot be greater than max ({})", min, max));
+                return Err(format!(
+                    "min port ({}) cannot be greater than max ({})",
+                    min, max
+                ));
             }
             Ok(min..=max)
         } else {

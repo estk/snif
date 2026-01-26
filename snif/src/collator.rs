@@ -1,6 +1,7 @@
+use crate::h1;
 use h2session::{
-    is_http2_preface, looks_like_http2_frame, parse_frames_stateful, H2ConnectionState,
-    ParsedH2Message, ParseError,
+    H2ConnectionState, ParseError, ParsedH2Message, is_http2_preface, looks_like_http2_frame,
+    parse_frames_stateful,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use snif_common::{Data, Kind, MAX_BUF_SIZE};
@@ -37,9 +38,9 @@ pub struct Connection {
     h2_request_state: Option<H2ConnectionState>,
     h2_response_state: Option<H2ConnectionState>,
 
-    // Completed messages from h2session
-    pending_requests: Vec<ParsedH2Message>,
-    pending_responses: Vec<ParsedH2Message>,
+    // Completed messages from h2session, keyed by stream_id
+    pending_requests: HashMap<u32, ParsedH2Message>,
+    pending_responses: HashMap<u32, ParsedH2Message>,
 }
 
 impl Connection {
@@ -55,30 +56,14 @@ impl Connection {
             response_complete: false,
             h2_request_state: None,
             h2_response_state: None,
-            pending_requests: Vec::new(),
-            pending_responses: Vec::new(),
+            pending_requests: HashMap::new(),
+            pending_responses: HashMap::new(),
         }
     }
 }
 
-/// A complete HTTP request
-#[derive(Debug, Clone)]
-pub struct HttpRequest {
-    pub method: Method,
-    pub uri: Uri,
-    pub headers: HeaderMap,
-    pub body: Vec<u8>,
-    pub _timestamp_ns: u64,
-}
-
-/// A complete HTTP response
-#[derive(Debug, Clone)]
-pub struct HttpResponse {
-    pub status: StatusCode,
-    pub headers: HeaderMap,
-    pub body: Vec<u8>,
-    pub _timestamp_ns: u64,
-}
+// Re-export HTTP request/response types from h1 module
+pub use crate::h1::{HttpRequest, HttpResponse};
 
 /// A complete request/response exchange
 #[derive(Debug)]
@@ -89,6 +74,8 @@ pub struct Exchange {
     pub protocol: Protocol,
     pub tgid: u32,
     pub remote_port: u16,
+    /// Stream ID for HTTP/2 (None for HTTP/1)
+    pub stream_id: Option<u32>,
 }
 
 impl std::fmt::Display for Exchange {
@@ -228,13 +215,20 @@ impl Collator {
             let exchange = build_exchange(conn);
 
             // Reset connection for next exchange
+            // For HTTP/1: clear everything
+            // For HTTP/2: only the matched pair was removed in build_exchange;
+            //             clear chunks but keep remaining pending messages
             conn.request_chunks.clear();
             conn.response_chunks.clear();
             conn.request_complete = false;
             conn.response_complete = false;
-            conn.protocol = Protocol::Unknown;
-            conn.pending_requests.clear();
-            conn.pending_responses.clear();
+
+            if conn.protocol == Protocol::Http1 {
+                conn.protocol = Protocol::Unknown;
+            }
+            // Note: For HTTP/2, don't clear pending_requests/pending_responses
+            //       as they may contain other streams. The matched pair was
+            //       already removed in build_exchange().
             // Note: Keep h2_*_state for HPACK persistence across exchanges
 
             return exchange;
@@ -265,26 +259,11 @@ fn detect_protocol(data: &[u8]) -> Protocol {
     }
 
     // Check for HTTP/1.x request
-    if is_http1_request(data) || is_http1_response(data) {
+    if h1::is_http1_request(data) || h1::is_http1_response(data) {
         return Protocol::Http1;
     }
 
     Protocol::Unknown
-}
-
-fn is_http1_request(data: &[u8]) -> bool {
-    data.starts_with(b"GET ")
-        || data.starts_with(b"POST ")
-        || data.starts_with(b"PUT ")
-        || data.starts_with(b"DELETE ")
-        || data.starts_with(b"HEAD ")
-        || data.starts_with(b"OPTIONS ")
-        || data.starts_with(b"PATCH ")
-        || data.starts_with(b"CONNECT ")
-}
-
-fn is_http1_response(data: &[u8]) -> bool {
-    data.starts_with(b"HTTP/1.0") || data.starts_with(b"HTTP/1.1")
 }
 
 /// Parse all accumulated request chunks through h2session
@@ -300,14 +279,16 @@ fn parse_http2_request_chunks(conn: &mut Connection) {
     }
 
     // Get or create H2 state for request direction
-    let state = conn.h2_request_state.get_or_insert_with(H2ConnectionState::new);
+    let state = conn
+        .h2_request_state
+        .get_or_insert_with(H2ConnectionState::new);
 
-    // Parse and collect completed messages
+    // Parse and merge completed messages by stream_id
     match parse_frames_stateful(&all_data, state) {
         Ok(messages) => {
-            for msg in messages {
+            for (stream_id, msg) in messages {
                 if msg.is_request() {
-                    conn.pending_requests.push(msg);
+                    conn.pending_requests.insert(stream_id, msg);
                 }
             }
         }
@@ -333,14 +314,16 @@ fn parse_http2_response_chunks(conn: &mut Connection) {
     }
 
     // Get or create H2 state for response direction
-    let state = conn.h2_response_state.get_or_insert_with(H2ConnectionState::new);
+    let state = conn
+        .h2_response_state
+        .get_or_insert_with(H2ConnectionState::new);
 
-    // Parse and collect completed messages
+    // Parse and merge completed messages by stream_id
     match parse_frames_stateful(&all_data, state) {
         Ok(messages) => {
-            for msg in messages {
+            for (stream_id, msg) in messages {
                 if msg.is_response() {
-                    conn.pending_responses.push(msg);
+                    conn.pending_responses.insert(stream_id, msg);
                 }
             }
         }
@@ -351,6 +334,14 @@ fn parse_http2_response_chunks(conn: &mut Connection) {
             // Other parse errors - log and continue
         }
     }
+}
+
+/// Find a stream_id that has both request and response ready
+fn find_complete_h2_stream(conn: &Connection) -> Option<u32> {
+    conn.pending_requests
+        .keys()
+        .find(|id| conn.pending_responses.contains_key(id))
+        .copied()
 }
 
 fn is_request_complete(conn: &Connection) -> bool {
@@ -365,9 +356,9 @@ fn is_request_complete(conn: &Connection) -> bool {
                 .iter()
                 .flat_map(|c| c.data.clone())
                 .collect();
-            is_http1_message_complete(&all_data)
+            h1::is_http1_message_complete(&all_data)
         }
-        Protocol::Http2 => !conn.pending_requests.is_empty(),
+        Protocol::Http2 => find_complete_h2_stream(conn).is_some(),
         Protocol::Unknown => false,
     }
 }
@@ -384,52 +375,14 @@ fn is_response_complete(conn: &Connection) -> bool {
                 .iter()
                 .flat_map(|c| c.data.clone())
                 .collect();
-            is_http1_message_complete(&all_data)
+            h1::is_http1_message_complete(&all_data)
         }
-        Protocol::Http2 => !conn.pending_responses.is_empty(),
+        Protocol::Http2 => find_complete_h2_stream(conn).is_some(),
         Protocol::Unknown => false,
     }
 }
 
-fn is_http1_message_complete(data: &[u8]) -> bool {
-    let s = match std::str::from_utf8(data) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-
-    // Find end of headers
-    let header_end = match s.find("\r\n\r\n") {
-        Some(pos) => pos + 4,
-        None => return false, // Headers not complete
-    };
-
-    let headers = &s[..header_end];
-    let body = &data[header_end..];
-
-    // Check for Content-Length
-    for line in headers.lines() {
-        if let Some(len_str) = line
-            .strip_prefix("Content-Length:")
-            .or_else(|| line.strip_prefix("content-length:"))
-            && let Ok(content_length) = len_str.trim().parse::<usize>()
-        {
-            return body.len() >= content_length;
-        }
-    }
-
-    // Check for Transfer-Encoding: chunked
-    if headers.contains("Transfer-Encoding: chunked")
-        || headers.contains("transfer-encoding: chunked")
-    {
-        // Look for final chunk (0\r\n\r\n)
-        return data.windows(5).any(|w| w == b"0\r\n\r\n");
-    }
-
-    // No Content-Length and not chunked - assume complete after headers (e.g., GET request)
-    true
-}
-
-fn build_exchange(conn: &Connection) -> Option<Exchange> {
+fn build_exchange(conn: &mut Connection) -> Option<Exchange> {
     // Use last request chunk timestamp (when request was fully sent)
     // vs first response chunk timestamp (when response started arriving)
     let request_time = conn
@@ -443,34 +396,33 @@ fn build_exchange(conn: &Connection) -> Option<Exchange> {
         .map(|c| c.timestamp_ns)
         .unwrap_or(0);
 
-    let request = match conn.protocol {
+    let (request, response, stream_id) = match conn.protocol {
         Protocol::Http1 => {
             let request_data: Vec<u8> = conn
                 .request_chunks
                 .iter()
                 .flat_map(|c| c.data.clone())
                 .collect();
-            parse_http1_request(&request_data, request_time)?
-        }
-        Protocol::Http2 => {
-            let msg = conn.pending_requests.first()?;
-            convert_h2_request(msg, request_time)?
-        }
-        Protocol::Unknown => return None,
-    };
+            let req = h1::parse_http1_request(&request_data, request_time)?;
 
-    let response = match conn.protocol {
-        Protocol::Http1 => {
             let response_data: Vec<u8> = conn
                 .response_chunks
                 .iter()
                 .flat_map(|c| c.data.clone())
                 .collect();
-            parse_http1_response(&response_data, response_time)?
+            let resp = h1::parse_http1_response(&response_data, response_time)?;
+
+            (req, resp, None)
         }
         Protocol::Http2 => {
-            let msg = conn.pending_responses.first()?;
-            convert_h2_response(msg, response_time)?
+            let sid = find_complete_h2_stream(conn)?;
+            let msg_req = conn.pending_requests.remove(&sid)?;
+            let msg_resp = conn.pending_responses.remove(&sid)?;
+
+            let req = convert_h2_request(&msg_req, request_time)?;
+            let resp = convert_h2_response(&msg_resp, response_time)?;
+
+            (req, resp, Some(sid))
         }
         Protocol::Unknown => return None,
     };
@@ -484,66 +436,7 @@ fn build_exchange(conn: &Connection) -> Option<Exchange> {
         protocol: conn.protocol,
         tgid: conn.tgid,
         remote_port: conn.remote_port,
-    })
-}
-
-fn parse_http1_request(data: &[u8], timestamp_ns: u64) -> Option<HttpRequest> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers);
-
-    let body_offset = match req.parse(data) {
-        Ok(httparse::Status::Complete(len)) => len,
-        _ => return None,
-    };
-
-    let method = Method::from_bytes(req.method?.as_bytes()).ok()?;
-    let uri: Uri = req.path?.parse().ok()?;
-
-    let mut header_map = HeaderMap::new();
-    for h in req.headers.iter() {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(h.name.as_bytes()),
-            HeaderValue::from_bytes(h.value),
-        ) {
-            header_map.insert(name, value);
-        }
-    }
-
-    Some(HttpRequest {
-        method,
-        uri,
-        headers: header_map,
-        body: data[body_offset..].to_vec(),
-        _timestamp_ns: timestamp_ns,
-    })
-}
-
-fn parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut res = httparse::Response::new(&mut headers);
-
-    let body_offset = match res.parse(data) {
-        Ok(httparse::Status::Complete(len)) => len,
-        _ => return None,
-    };
-
-    let status = StatusCode::from_u16(res.code?).ok()?;
-
-    let mut header_map = HeaderMap::new();
-    for h in res.headers.iter() {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(h.name.as_bytes()),
-            HeaderValue::from_bytes(h.value),
-        ) {
-            header_map.insert(name, value);
-        }
-    }
-
-    Some(HttpResponse {
-        status,
-        headers: header_map,
-        body: data[body_offset..].to_vec(),
-        _timestamp_ns: timestamp_ns,
+        stream_id,
     })
 }
 
@@ -583,7 +476,7 @@ fn convert_h2_request(msg: &ParsedH2Message, timestamp_ns: u64) -> Option<HttpRe
         uri,
         headers: header_map,
         body: msg.body.clone(),
-        _timestamp_ns: timestamp_ns,
+        timestamp_ns,
     })
 }
 
@@ -612,6 +505,6 @@ fn convert_h2_response(msg: &ParsedH2Message, timestamp_ns: u64) -> Option<HttpR
         status,
         headers: header_map,
         body: msg.body.clone(),
-        _timestamp_ns: timestamp_ns,
+        timestamp_ns,
     })
 }

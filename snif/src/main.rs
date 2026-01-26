@@ -114,7 +114,10 @@ fn parse_size_range(s: &str) -> Result<RangeInclusive<usize>, String> {
                 .parse::<usize>()
                 .map_err(|e| format!("invalid max size '{}': {}", max, e))?;
             if min > max {
-                return Err(format!("min ({}) cannot be greater than max ({})", min, max));
+                return Err(format!(
+                    "min ({}) cannot be greater than max ({})",
+                    min, max
+                ));
             }
             Ok(min..=max)
         }

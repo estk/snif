@@ -9,9 +9,9 @@ use aya_ebpf::{
     programs::ProbeContext,
 };
 use aya_log_ebpf::info;
-use snif_common::{Kind, ADDR_SIZE, MAX_BUF_SIZE};
+use snif_common::{ADDR_SIZE, Kind, MAX_BUF_SIZE};
 
-use crate::openssl::{EntryData, BUFFERS, EVENTS, STORAGE};
+use crate::openssl::{BUFFERS, EVENTS, EntryData, STORAGE};
 use crate::vmlinux::{fdtable, file, files_struct, inode, sock, sock_common, socket, task_struct};
 
 // S_IFMT mask and S_IFSOCK value for checking socket file type
