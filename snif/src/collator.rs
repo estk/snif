@@ -1,9 +1,8 @@
 use crate::h1;
 use h2session::{
-    H2ConnectionState, ParseError, ParsedH2Message, is_http2_preface, looks_like_http2_frame,
-    parse_frames_stateful,
+    is_http2_preface, looks_like_http2_frame, parse_frames_stateful, H2ConnectionState, ParseError,
+    ParsedH2Message,
 };
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use snif_common::{Data, Kind, MAX_BUF_SIZE};
 use std::collections::HashMap;
 
@@ -442,39 +441,10 @@ fn build_exchange(conn: &mut Connection) -> Option<Exchange> {
 
 /// Convert a ParsedH2Message to an HttpRequest
 fn convert_h2_request(msg: &ParsedH2Message, timestamp_ns: u64) -> Option<HttpRequest> {
-    let method_str = msg.method.as_ref()?;
-    let method = Method::from_bytes(method_str.as_bytes()).ok()?;
-
-    let path_str = msg.path.as_deref().unwrap_or("/");
-    let uri: Uri = path_str.parse().ok()?;
-
-    let mut header_map = HeaderMap::new();
-
-    // Convert :authority to Host header
-    if let Some(authority) = &msg.authority {
-        if let Ok(v) = HeaderValue::from_str(authority) {
-            header_map.insert(http::header::HOST, v);
-        }
-    }
-
-    // Convert regular headers
-    for (name, value) in &msg.headers {
-        // Skip pseudo-headers
-        if name.starts_with(':') {
-            continue;
-        }
-        if let (Ok(n), Ok(v)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            header_map.insert(n, v);
-        }
-    }
-
     Some(HttpRequest {
-        method,
-        uri,
-        headers: header_map,
+        method: msg.http_method()?,
+        uri: msg.http_uri()?,
+        headers: msg.http_headers(),
         body: msg.body.clone(),
         timestamp_ns,
     })
@@ -482,28 +452,9 @@ fn convert_h2_request(msg: &ParsedH2Message, timestamp_ns: u64) -> Option<HttpRe
 
 /// Convert a ParsedH2Message to an HttpResponse
 fn convert_h2_response(msg: &ParsedH2Message, timestamp_ns: u64) -> Option<HttpResponse> {
-    let status_code = msg.status?;
-    let status = StatusCode::from_u16(status_code).ok()?;
-
-    let mut header_map = HeaderMap::new();
-
-    // Convert regular headers
-    for (name, value) in &msg.headers {
-        // Skip pseudo-headers
-        if name.starts_with(':') {
-            continue;
-        }
-        if let (Ok(n), Ok(v)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            header_map.insert(n, v);
-        }
-    }
-
     Some(HttpResponse {
-        status,
-        headers: header_map,
+        status: msg.http_status()?,
+        headers: msg.http_headers(),
         body: msg.body.clone(),
         timestamp_ns,
     })
