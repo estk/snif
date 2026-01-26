@@ -16,11 +16,8 @@ use tokio::signal;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-mod collator;
-mod filter;
-
-use collator::Collator;
-use filter::{AddrFilter, Direction, Filters, PortFilter};
+use snif_lib::collator::Collator;
+use snif_lib::filter::{AddrFilter, Direction, Filters, PortFilter};
 
 /// CLI direction enum that maps to filter::Direction
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
