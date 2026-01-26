@@ -23,7 +23,7 @@ tokio = { version = "1.49", features = [
     "io-util",
 ] }
 bytes = "1.11.0"
-hpack = "0.3"
+h2session = { path = "../../h2session" }
 http = "1"
 httparse = "1"
 tokio-util = "0.7"

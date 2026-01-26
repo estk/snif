@@ -1,9 +1,10 @@
-use hpack::Decoder;
+use h2session::{
+    is_http2_preface, looks_like_http2_frame, parse_frames_stateful, H2ConnectionState,
+    ParsedH2Message, ParseError,
+};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use snif_common::{Data, Kind, MAX_BUF_SIZE};
 use std::collections::HashMap;
-
-const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Protocol detected for a connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +23,6 @@ pub struct DataChunk {
 }
 
 /// Tracks state for a single connection
-#[derive(Debug)]
 pub struct Connection {
     pub tgid: u32,
     pub remote_port: u16,
@@ -32,6 +32,14 @@ pub struct Connection {
     pub last_activity_ns: u64,
     pub request_complete: bool,
     pub response_complete: bool,
+
+    // HTTP/2 state (separate per direction for HPACK)
+    h2_request_state: Option<H2ConnectionState>,
+    h2_response_state: Option<H2ConnectionState>,
+
+    // Completed messages from h2session
+    pending_requests: Vec<ParsedH2Message>,
+    pending_responses: Vec<ParsedH2Message>,
 }
 
 impl Connection {
@@ -45,6 +53,10 @@ impl Connection {
             last_activity_ns: 0,
             request_complete: false,
             response_complete: false,
+            h2_request_state: None,
+            h2_response_state: None,
+            pending_requests: Vec::new(),
+            pending_responses: Vec::new(),
         }
     }
 }
@@ -181,6 +193,12 @@ impl Collator {
         match data.kind {
             Kind::SslWrite | Kind::SocketWrite => {
                 conn.request_chunks.push(chunk);
+
+                // For HTTP/2, parse incrementally
+                if conn.protocol == Protocol::Http2 {
+                    parse_http2_request_chunks(conn);
+                }
+
                 // Check if request is complete
                 if is_request_complete(conn) {
                     conn.request_complete = true;
@@ -188,6 +206,12 @@ impl Collator {
             }
             Kind::SslRead | Kind::SocketRead => {
                 conn.response_chunks.push(chunk);
+
+                // For HTTP/2, parse incrementally
+                if conn.protocol == Protocol::Http2 {
+                    parse_http2_response_chunks(conn);
+                }
+
                 // Check if response is complete
                 if is_response_complete(conn) {
                     conn.response_complete = true;
@@ -209,6 +233,9 @@ impl Collator {
             conn.request_complete = false;
             conn.response_complete = false;
             conn.protocol = Protocol::Unknown;
+            conn.pending_requests.clear();
+            conn.pending_responses.clear();
+            // Note: Keep h2_*_state for HPACK persistence across exchanges
 
             return exchange;
         }
@@ -228,19 +255,13 @@ impl Collator {
 
 fn detect_protocol(data: &[u8]) -> Protocol {
     // Check for HTTP/2 preface
-    if data.starts_with(HTTP2_PREFACE) {
+    if is_http2_preface(data) {
         return Protocol::Http2;
     }
 
-    // Check for HTTP/2 frame header
-    if data.len() >= 9 {
-        let frame_type = data[3];
-        if frame_type <= 0x9 {
-            let length = ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32);
-            if length <= 16384 {
-                return Protocol::Http2;
-            }
-        }
+    // Check for HTTP/2 frame header heuristic
+    if looks_like_http2_frame(data) {
+        return Protocol::Http2;
     }
 
     // Check for HTTP/1.x request
@@ -266,20 +287,87 @@ fn is_http1_response(data: &[u8]) -> bool {
     data.starts_with(b"HTTP/1.0") || data.starts_with(b"HTTP/1.1")
 }
 
-fn is_request_complete(conn: &Connection) -> bool {
-    if conn.request_chunks.is_empty() {
-        return false;
-    }
-
+/// Parse all accumulated request chunks through h2session
+fn parse_http2_request_chunks(conn: &mut Connection) {
     let all_data: Vec<u8> = conn
         .request_chunks
         .iter()
         .flat_map(|c| c.data.clone())
         .collect();
 
+    if all_data.is_empty() {
+        return;
+    }
+
+    // Get or create H2 state for request direction
+    let state = conn.h2_request_state.get_or_insert_with(H2ConnectionState::new);
+
+    // Parse and collect completed messages
+    match parse_frames_stateful(&all_data, state) {
+        Ok(messages) => {
+            for msg in messages {
+                if msg.is_request() {
+                    conn.pending_requests.push(msg);
+                }
+            }
+        }
+        Err(ParseError::Http2BufferTooSmall) => {
+            // Not enough data yet - normal case
+        }
+        Err(_) => {
+            // Other parse errors - log and continue
+        }
+    }
+}
+
+/// Parse all accumulated response chunks through h2session
+fn parse_http2_response_chunks(conn: &mut Connection) {
+    let all_data: Vec<u8> = conn
+        .response_chunks
+        .iter()
+        .flat_map(|c| c.data.clone())
+        .collect();
+
+    if all_data.is_empty() {
+        return;
+    }
+
+    // Get or create H2 state for response direction
+    let state = conn.h2_response_state.get_or_insert_with(H2ConnectionState::new);
+
+    // Parse and collect completed messages
+    match parse_frames_stateful(&all_data, state) {
+        Ok(messages) => {
+            for msg in messages {
+                if msg.is_response() {
+                    conn.pending_responses.push(msg);
+                }
+            }
+        }
+        Err(ParseError::Http2BufferTooSmall) => {
+            // Not enough data yet - normal case
+        }
+        Err(_) => {
+            // Other parse errors - log and continue
+        }
+    }
+}
+
+fn is_request_complete(conn: &Connection) -> bool {
+    if conn.request_chunks.is_empty() {
+        return false;
+    }
+
     match conn.protocol {
-        Protocol::Http1 => is_http1_message_complete(&all_data),
-        Protocol::Http2 => is_http2_request_complete(&all_data),
+        Protocol::Http1 => {
+            let all_data: Vec<u8> = conn
+                .request_chunks
+                .iter()
+                .flat_map(|c| c.data.clone())
+                .collect();
+            is_http1_message_complete(&all_data)
+        }
+        Protocol::Http2 => !conn.pending_requests.is_empty(),
         Protocol::Unknown => false,
     }
 }
@@ -289,15 +377,16 @@ fn is_response_complete(conn: &Connection) -> bool {
         return false;
     }
 
-    let all_data: Vec<u8> = conn
-        .response_chunks
-        .iter()
-        .flat_map(|c| c.data.clone())
-        .collect();
-
     match conn.protocol {
-        Protocol::Http1 => is_http1_message_complete(&all_data),
-        Protocol::Http2 => is_http2_response_complete(&all_data),
+        Protocol::Http1 => {
+            let all_data: Vec<u8> = conn
+                .response_chunks
+                .iter()
+                .flat_map(|c| c.data.clone())
+                .collect();
+            is_http1_message_complete(&all_data)
+        }
+        Protocol::Http2 => !conn.pending_responses.is_empty(),
         Protocol::Unknown => false,
     }
 }
@@ -340,83 +429,7 @@ fn is_http1_message_complete(data: &[u8]) -> bool {
     true
 }
 
-fn is_http2_request_complete(data: &[u8]) -> bool {
-    // For HTTP/2, look for HEADERS frame with END_HEADERS flag (0x04)
-    // and optionally DATA frame with END_STREAM flag (0x01)
-    let mut offset = 0;
-
-    // Skip preface if present
-    if data.starts_with(HTTP2_PREFACE) {
-        offset = HTTP2_PREFACE.len();
-    }
-
-    let mut has_headers_end = false;
-
-    while offset + 9 <= data.len() {
-        let length = ((data[offset] as u32) << 16)
-            | ((data[offset + 1] as u32) << 8)
-            | (data[offset + 2] as u32);
-        let frame_type = data[offset + 3];
-        let flags = data[offset + 4];
-
-        // HEADERS frame (0x01) with END_STREAM (0x01) or END_HEADERS (0x04)
-        if frame_type == 0x01 && (flags & 0x01 != 0 || flags & 0x04 != 0) {
-            has_headers_end = true;
-        }
-
-        // DATA frame (0x00) with END_STREAM (0x01)
-        if frame_type == 0x00 && flags & 0x01 != 0 {
-            return true;
-        }
-
-        offset += 9 + length as usize;
-    }
-
-    has_headers_end
-}
-
-fn is_http2_response_complete(data: &[u8]) -> bool {
-    // Look for DATA frame with END_STREAM flag, or just any DATA frame with body content
-    let mut offset = 0;
-    let mut has_data_frame = false;
-
-    while offset + 9 <= data.len() {
-        let length = ((data[offset] as u32) << 16)
-            | ((data[offset + 1] as u32) << 8)
-            | (data[offset + 2] as u32);
-        let frame_type = data[offset + 3];
-        let flags = data[offset + 4];
-
-        // DATA frame (0x00) with END_STREAM (0x01)
-        if frame_type == 0x00 && flags & 0x01 != 0 {
-            return true;
-        }
-
-        // Any DATA frame with content
-        if frame_type == 0x00 && length > 0 {
-            has_data_frame = true;
-        }
-
-        offset += 9 + length as usize;
-    }
-
-    // If we have a DATA frame with content, consider it complete
-    // This is a heuristic for cases where END_STREAM might be in a separate event
-    has_data_frame
-}
-
 fn build_exchange(conn: &Connection) -> Option<Exchange> {
-    let request_data: Vec<u8> = conn
-        .request_chunks
-        .iter()
-        .flat_map(|c| c.data.clone())
-        .collect();
-    let response_data: Vec<u8> = conn
-        .response_chunks
-        .iter()
-        .flat_map(|c| c.data.clone())
-        .collect();
-
     // Use last request chunk timestamp (when request was fully sent)
     // vs first response chunk timestamp (when response started arriving)
     let request_time = conn
@@ -431,14 +444,34 @@ fn build_exchange(conn: &Connection) -> Option<Exchange> {
         .unwrap_or(0);
 
     let request = match conn.protocol {
-        Protocol::Http1 => parse_http1_request(&request_data, request_time)?,
-        Protocol::Http2 => parse_http2_request(&request_data, request_time)?,
+        Protocol::Http1 => {
+            let request_data: Vec<u8> = conn
+                .request_chunks
+                .iter()
+                .flat_map(|c| c.data.clone())
+                .collect();
+            parse_http1_request(&request_data, request_time)?
+        }
+        Protocol::Http2 => {
+            let msg = conn.pending_requests.first()?;
+            convert_h2_request(msg, request_time)?
+        }
         Protocol::Unknown => return None,
     };
 
     let response = match conn.protocol {
-        Protocol::Http1 => parse_http1_response(&response_data, response_time)?,
-        Protocol::Http2 => parse_http2_response(&response_data, response_time)?,
+        Protocol::Http1 => {
+            let response_data: Vec<u8> = conn
+                .response_chunks
+                .iter()
+                .flat_map(|c| c.data.clone())
+                .collect();
+            parse_http1_response(&response_data, response_time)?
+        }
+        Protocol::Http2 => {
+            let msg = conn.pending_responses.first()?;
+            convert_h2_response(msg, response_time)?
+        }
         Protocol::Unknown => return None,
     };
 
@@ -514,52 +547,34 @@ fn parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> 
     })
 }
 
-fn parse_http2_request(data: &[u8], timestamp_ns: u64) -> Option<HttpRequest> {
-    let mut method = Method::GET;
-    let mut uri: Uri = "/".parse().ok()?;
+/// Convert a ParsedH2Message to an HttpRequest
+fn convert_h2_request(msg: &ParsedH2Message, timestamp_ns: u64) -> Option<HttpRequest> {
+    let method_str = msg.method.as_ref()?;
+    let method = Method::from_bytes(method_str.as_bytes()).ok()?;
+
+    let path_str = msg.path.as_deref().unwrap_or("/");
+    let uri: Uri = path_str.parse().ok()?;
+
     let mut header_map = HeaderMap::new();
 
-    // Try to decode HPACK headers
-    let header_blocks = extract_http2_header_blocks(data);
-    if !header_blocks.is_empty() {
-        let mut decoder = Decoder::new();
-        for block in header_blocks {
-            if let Ok(decoded_headers) = decoder.decode(&block) {
-                for (name, value) in decoded_headers {
-                    let name_str = String::from_utf8_lossy(&name);
-                    let value_str = String::from_utf8_lossy(&value);
+    // Convert :authority to Host header
+    if let Some(authority) = &msg.authority {
+        if let Ok(v) = HeaderValue::from_str(authority) {
+            header_map.insert(http::header::HOST, v);
+        }
+    }
 
-                    // Extract pseudo-headers
-                    match name_str.as_ref() {
-                        ":method" => {
-                            if let Ok(m) = Method::from_bytes(value.as_slice()) {
-                                method = m;
-                            }
-                            continue;
-                        }
-                        ":path" => {
-                            if let Ok(u) = value_str.parse() {
-                                uri = u;
-                            }
-                            continue;
-                        }
-                        ":authority" => {
-                            if let Ok(v) = HeaderValue::from_bytes(&value) {
-                                header_map.insert(http::header::HOST, v);
-                            }
-                            continue;
-                        }
-                        _ if name_str.starts_with(':') => continue,
-                        _ => {}
-                    }
-                    if let (Ok(n), Ok(v)) = (
-                        HeaderName::from_bytes(&name),
-                        HeaderValue::from_bytes(&value),
-                    ) {
-                        header_map.insert(n, v);
-                    }
-                }
-            }
+    // Convert regular headers
+    for (name, value) in &msg.headers {
+        // Skip pseudo-headers
+        if name.starts_with(':') {
+            continue;
+        }
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            header_map.insert(n, v);
         }
     }
 
@@ -567,126 +582,36 @@ fn parse_http2_request(data: &[u8], timestamp_ns: u64) -> Option<HttpRequest> {
         method,
         uri,
         headers: header_map,
-        body: extract_http2_data_payload(data),
+        body: msg.body.clone(),
         _timestamp_ns: timestamp_ns,
     })
 }
 
-fn parse_http2_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> {
-    let mut status = StatusCode::OK;
+/// Convert a ParsedH2Message to an HttpResponse
+fn convert_h2_response(msg: &ParsedH2Message, timestamp_ns: u64) -> Option<HttpResponse> {
+    let status_code = msg.status?;
+    let status = StatusCode::from_u16(status_code).ok()?;
+
     let mut header_map = HeaderMap::new();
 
-    // Try to decode HPACK headers
-    let header_blocks = extract_http2_header_blocks(data);
-    if !header_blocks.is_empty() {
-        let mut decoder = Decoder::new();
-        for block in header_blocks {
-            if let Ok(decoded_headers) = decoder.decode(&block) {
-                for (name, value) in decoded_headers {
-                    let name_str = String::from_utf8_lossy(&name);
-                    let value_str = String::from_utf8_lossy(&value);
-
-                    // Extract pseudo-headers
-                    if name_str == ":status" {
-                        if let Ok(code) = value_str.parse::<u16>()
-                            && let Ok(s) = StatusCode::from_u16(code)
-                        {
-                            status = s;
-                        }
-                        continue;
-                    } else if name_str.starts_with(':') {
-                        continue;
-                    }
-                    if let (Ok(n), Ok(v)) = (
-                        HeaderName::from_bytes(&name),
-                        HeaderValue::from_bytes(&value),
-                    ) {
-                        header_map.insert(n, v);
-                    }
-                }
-            }
+    // Convert regular headers
+    for (name, value) in &msg.headers {
+        // Skip pseudo-headers
+        if name.starts_with(':') {
+            continue;
+        }
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            header_map.insert(n, v);
         }
     }
 
     Some(HttpResponse {
         status,
         headers: header_map,
-        body: extract_http2_data_payload(data),
+        body: msg.body.clone(),
         _timestamp_ns: timestamp_ns,
     })
-}
-
-/// Extract header block fragments from HEADERS and CONTINUATION frames
-fn extract_http2_header_blocks(data: &[u8]) -> Vec<Vec<u8>> {
-    let mut blocks = Vec::new();
-    let mut offset = 0;
-
-    // Skip HTTP/2 preface if present
-    if data.starts_with(HTTP2_PREFACE) {
-        offset = HTTP2_PREFACE.len();
-    }
-
-    while offset + 9 <= data.len() {
-        let length = ((data[offset] as u32) << 16)
-            | ((data[offset + 1] as u32) << 8)
-            | (data[offset + 2] as u32);
-        let frame_type = data[offset + 3];
-        let flags = data[offset + 4];
-
-        let frame_end = offset + 9 + length as usize;
-        if frame_end > data.len() {
-            break;
-        }
-
-        // HEADERS frame (0x01) or CONTINUATION frame (0x09)
-        if frame_type == 0x01 || frame_type == 0x09 {
-            let mut payload_start = offset + 9;
-            let mut payload_end = frame_end;
-
-            // Handle PADDED flag (0x08) - only for HEADERS
-            if frame_type == 0x01 && (flags & 0x08) != 0 && payload_start < frame_end {
-                let pad_length = data[payload_start] as usize;
-                payload_start += 1;
-                if payload_end > pad_length {
-                    payload_end -= pad_length;
-                }
-            }
-
-            // Handle PRIORITY flag (0x20) - only for HEADERS
-            if frame_type == 0x01 && (flags & 0x20) != 0 {
-                payload_start += 5; // 4 bytes stream dependency + 1 byte weight
-            }
-
-            if payload_start < payload_end {
-                blocks.push(data[payload_start..payload_end].to_vec());
-            }
-        }
-
-        offset = frame_end;
-    }
-
-    blocks
-}
-
-fn extract_http2_data_payload(data: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::new();
-    let mut offset = 0;
-
-    while offset + 9 <= data.len() {
-        let length = ((data[offset] as u32) << 16)
-            | ((data[offset + 1] as u32) << 8)
-            | (data[offset + 2] as u32);
-        let frame_type = data[offset + 3];
-
-        let frame_end = offset + 9 + length as usize;
-
-        // DATA frame (0x00)
-        if frame_type == 0x00 && frame_end <= data.len() {
-            payload.extend_from_slice(&data[offset + 9..frame_end]);
-        }
-
-        offset = frame_end;
-    }
-
-    payload
 }
