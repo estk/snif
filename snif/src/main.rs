@@ -74,7 +74,7 @@ struct Opt {
     header_matches_regex: Option<Regex>,
 
     /// Match if header exists
-    #[clap(short, long)]
+    #[clap(long)]
     header_name: Option<String>,
 
     /// Filter by traffic direction

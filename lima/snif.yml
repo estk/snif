@@ -42,7 +42,7 @@ provision:
       cargo install bpf-linker --no-default-features --features llvm-21
 
       # Install miniserve
-      cargo binstall miniserve
+      cargo binstall miniserve cargo-nextest cargo-shear
 
       # Auto-cd to project directory on shell login
       echo 'cd ~/git/snif 2>/dev/null || true' >> ~/.profile
