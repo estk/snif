@@ -1,8 +1,5 @@
 use crate::h1;
-use h2session::{
-    H2ConnectionState, ParseError, ParsedH2Message, is_http2_preface, looks_like_http2_frame,
-    parse_frames_stateful,
-};
+use h2session::{is_http2_preface, looks_like_http2_frame, H2ConnectionState, ParsedH2Message};
 use snif_common::{Data, Kind, MAX_BUF_SIZE};
 use std::collections::HashMap;
 
@@ -34,6 +31,10 @@ pub struct Connection {
     pub request_complete: bool,
     pub response_complete: bool,
 
+    // HTTP/2 state (separate per direction for HPACK persistence)
+    h2_request_state: H2ConnectionState,
+    h2_response_state: H2ConnectionState,
+
     // Completed messages from h2session, keyed by stream_id
     pending_requests: HashMap<u32, ParsedH2Message>,
     pending_responses: HashMap<u32, ParsedH2Message>,
@@ -55,6 +56,8 @@ impl Connection {
             last_activity_ns: 0,
             request_complete: false,
             response_complete: false,
+            h2_request_state: H2ConnectionState::new(),
+            h2_response_state: H2ConnectionState::new(),
             pending_requests: HashMap::new(),
             pending_responses: HashMap::new(),
         }
@@ -228,6 +231,8 @@ impl Collator {
             //             clear chunks but keep remaining pending messages
             conn.request_chunks.clear();
             conn.response_chunks.clear();
+            conn.h2_request_state.clear_buffer();
+            conn.h2_response_state.clear_buffer();
             conn.request_complete = false;
             conn.response_complete = false;
 
@@ -237,6 +242,7 @@ impl Collator {
             // Note: For HTTP/2, don't clear pending_requests/pending_responses
             //       as they may contain other streams. The matched pair was
             //       already removed in build_exchange().
+            // Note: Keep h2_*_state HPACK decoder for connection persistence.
 
             return exchange;
         }
@@ -273,74 +279,44 @@ fn detect_protocol(data: &[u8]) -> Protocol {
     Protocol::Unknown
 }
 
-/// Parse all accumulated request chunks through h2session.
-/// Resets parser state on each call to avoid body duplication from re-parsing DATA frames.
+/// Feed the latest request chunk to h2session for incremental parsing.
+/// Uses the new feed() API which maintains internal buffer and parses incrementally.
 fn parse_http2_request_chunks(conn: &mut Connection) {
-    let all_data: Vec<u8> = conn
-        .request_chunks
-        .iter()
-        .flat_map(|c| c.data.clone())
-        .collect();
+    // Get the latest chunk that was just added
+    let chunk = match conn.request_chunks.last() {
+        Some(c) => c,
+        None => return,
+    };
 
-    if all_data.is_empty() {
-        return;
-    }
+    // Feed the new data to h2session with its timestamp
+    // Parse errors are non-fatal, continue
+    let _ = conn.h2_request_state.feed(&chunk.data, chunk.timestamp_ns);
 
-    // Reset h2 state on each parse to avoid body duplication.
-    // When parse_frames_stateful processes DATA frames, it extends stream.body.
-    // Re-parsing the same data would extend body again with duplicate data.
-    // By resetting state, we parse fresh each time with empty body.
-    let mut state = H2ConnectionState::new();
-
-    // Parse and merge completed messages by stream_id
-    match parse_frames_stateful(&all_data, &mut state) {
-        Ok(messages) => {
-            for (stream_id, msg) in messages {
-                if msg.is_request() {
-                    conn.pending_requests.insert(stream_id, msg);
-                }
-            }
-        }
-        Err(ParseError::Http2BufferTooSmall) => {
-            // Not enough data yet - normal case
-        }
-        Err(_) => {
-            // Other parse errors - log and continue
+    // Pop any completed messages and add to pending
+    while let Some((stream_id, msg)) = conn.h2_request_state.try_pop() {
+        if msg.is_request() {
+            conn.pending_requests.insert(stream_id, msg);
         }
     }
 }
 
-/// Parse all accumulated response chunks through h2session.
-/// Resets parser state on each call to avoid body duplication from re-parsing DATA frames.
+/// Feed the latest response chunk to h2session for incremental parsing.
+/// Uses the new feed() API which maintains internal buffer and parses incrementally.
 fn parse_http2_response_chunks(conn: &mut Connection) {
-    let all_data: Vec<u8> = conn
-        .response_chunks
-        .iter()
-        .flat_map(|c| c.data.clone())
-        .collect();
+    // Get the latest chunk that was just added
+    let chunk = match conn.response_chunks.last() {
+        Some(c) => c,
+        None => return,
+    };
 
-    if all_data.is_empty() {
-        return;
-    }
+    // Feed the new data to h2session with its timestamp
+    // Parse errors are non-fatal, continue
+    let _ = conn.h2_response_state.feed(&chunk.data, chunk.timestamp_ns);
 
-    // Reset h2 state on each parse to avoid body duplication.
-    // See parse_http2_request_chunks for detailed explanation.
-    let mut state = H2ConnectionState::new();
-
-    // Parse and merge completed messages by stream_id
-    match parse_frames_stateful(&all_data, &mut state) {
-        Ok(messages) => {
-            for (stream_id, msg) in messages {
-                if msg.is_response() {
-                    conn.pending_responses.insert(stream_id, msg);
-                }
-            }
-        }
-        Err(ParseError::Http2BufferTooSmall) => {
-            // Not enough data yet - normal case
-        }
-        Err(_) => {
-            // Other parse errors - log and continue
+    // Pop any completed messages and add to pending
+    while let Some((stream_id, msg)) = conn.h2_response_state.try_pop() {
+        if msg.is_response() {
+            conn.pending_responses.insert(stream_id, msg);
         }
     }
 }
@@ -392,21 +368,20 @@ fn is_response_complete(conn: &Connection) -> bool {
 }
 
 fn build_exchange(conn: &mut Connection) -> Option<Exchange> {
-    // Use last request chunk timestamp (when request was fully sent)
-    // vs first response chunk timestamp (when response started arriving)
-    let request_time = conn
-        .request_chunks
-        .last()
-        .map(|c| c.timestamp_ns)
-        .unwrap_or(0);
-    let response_time = conn
-        .response_chunks
-        .first()
-        .map(|c| c.timestamp_ns)
-        .unwrap_or(0);
-
-    let (request, response, stream_id) = match conn.protocol {
+    let (request, response, stream_id, latency_ns) = match conn.protocol {
         Protocol::Http1 => {
+            // For HTTP/1, use chunk timestamps
+            let request_time = conn
+                .request_chunks
+                .last()
+                .map(|c| c.timestamp_ns)
+                .unwrap_or(0);
+            let response_time = conn
+                .response_chunks
+                .first()
+                .map(|c| c.timestamp_ns)
+                .unwrap_or(0);
+
             let request_data: Vec<u8> = conn
                 .request_chunks
                 .iter()
@@ -421,22 +396,28 @@ fn build_exchange(conn: &mut Connection) -> Option<Exchange> {
                 .collect();
             let resp = h1::parse_http1_response(&response_data, response_time)?;
 
-            (req, resp, None)
+            let latency = response_time.saturating_sub(request_time);
+            (req, resp, None, latency)
         }
         Protocol::Http2 => {
             let sid = find_complete_h2_stream(conn)?;
             let msg_req = conn.pending_requests.remove(&sid)?;
             let msg_resp = conn.pending_responses.remove(&sid)?;
 
-            let req = convert_h2_request(&msg_req, request_time)?;
-            let resp = convert_h2_response(&msg_resp, response_time)?;
+            // For HTTP/2, use per-stream timestamps from the parsed messages
+            // Request complete time: when END_STREAM was seen on request
+            // Response start time: when first frame was received on response
+            let request_complete_time = msg_req.end_stream_timestamp_ns;
+            let response_start_time = msg_resp.first_frame_timestamp_ns;
 
-            (req, resp, Some(sid))
+            let req = convert_h2_request(&msg_req)?;
+            let resp = convert_h2_response(&msg_resp)?;
+
+            let latency = response_start_time.saturating_sub(request_complete_time);
+            (req, resp, Some(sid), latency)
         }
         Protocol::Unknown => return None,
     };
-
-    let latency_ns = response_time.saturating_sub(request_time);
 
     Some(Exchange {
         request,
@@ -450,22 +431,24 @@ fn build_exchange(conn: &mut Connection) -> Option<Exchange> {
 }
 
 /// Convert a ParsedH2Message to an HttpRequest
-fn convert_h2_request(msg: &ParsedH2Message, timestamp_ns: u64) -> Option<HttpRequest> {
+fn convert_h2_request(msg: &ParsedH2Message) -> Option<HttpRequest> {
     Some(HttpRequest {
         method: msg.http_method()?,
         uri: msg.http_uri()?,
         headers: msg.http_headers(),
         body: msg.body.clone(),
-        timestamp_ns,
+        // Use the stream's end_stream timestamp (when request was fully sent)
+        timestamp_ns: msg.end_stream_timestamp_ns,
     })
 }
 
 /// Convert a ParsedH2Message to an HttpResponse
-fn convert_h2_response(msg: &ParsedH2Message, timestamp_ns: u64) -> Option<HttpResponse> {
+fn convert_h2_response(msg: &ParsedH2Message) -> Option<HttpResponse> {
     Some(HttpResponse {
         status: msg.http_status()?,
         headers: msg.http_headers(),
         body: msg.body.clone(),
-        timestamp_ns,
+        // Use the stream's first_frame timestamp (when response started arriving)
+        timestamp_ns: msg.first_frame_timestamp_ns,
     })
 }
