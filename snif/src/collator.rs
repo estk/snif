@@ -31,6 +31,10 @@ pub struct Connection {
     pub request_complete: bool,
     pub response_complete: bool,
 
+    // HTTP/1 parsed messages (when complete)
+    h1_request: Option<HttpRequest>,
+    h1_response: Option<HttpResponse>,
+
     // HTTP/2 state (separate per direction for HPACK persistence)
     h2_request_state: H2ConnectionState,
     h2_response_state: H2ConnectionState,
@@ -56,6 +60,8 @@ impl Connection {
             last_activity_ns: 0,
             request_complete: false,
             response_complete: false,
+            h1_request: None,
+            h1_response: None,
             h2_request_state: H2ConnectionState::new(),
             h2_response_state: H2ConnectionState::new(),
             pending_requests: HashMap::new(),
@@ -192,9 +198,15 @@ impl Collator {
             Kind::SslWrite | Kind::SocketWrite => {
                 conn.request_chunks.push(chunk);
 
-                // For HTTP/2, parse incrementally
-                if conn.protocol == Protocol::Http2 {
-                    parse_http2_request_chunks(conn);
+                // Parse incrementally based on protocol
+                match conn.protocol {
+                    Protocol::Http1 if conn.h1_request.is_none() => {
+                        try_parse_http1_request_chunks(conn);
+                    }
+                    Protocol::Http2 => {
+                        parse_http2_request_chunks(conn);
+                    }
+                    _ => {}
                 }
 
                 // Check if request is complete
@@ -205,9 +217,15 @@ impl Collator {
             Kind::SslRead | Kind::SocketRead => {
                 conn.response_chunks.push(chunk);
 
-                // For HTTP/2, parse incrementally
-                if conn.protocol == Protocol::Http2 {
-                    parse_http2_response_chunks(conn);
+                // Parse incrementally based on protocol
+                match conn.protocol {
+                    Protocol::Http1 if conn.h1_response.is_none() => {
+                        try_parse_http1_response_chunks(conn);
+                    }
+                    Protocol::Http2 => {
+                        parse_http2_response_chunks(conn);
+                    }
+                    _ => {}
                 }
 
                 // Check if response is complete
@@ -233,7 +251,7 @@ impl Collator {
             let exchange = build_exchange(conn);
 
             // Reset connection for next exchange
-            // For HTTP/1: clear everything
+            // For HTTP/1: clear everything including parsed messages
             // For HTTP/2: only the matched pair was removed in build_exchange;
             //             clear chunks but keep remaining pending messages
             conn.request_chunks.clear();
@@ -244,6 +262,8 @@ impl Collator {
             conn.response_complete = false;
 
             if conn.protocol == Protocol::Http1 {
+                conn.h1_request = None;
+                conn.h1_response = None;
                 conn.protocol = Protocol::Unknown;
             }
             // Note: For HTTP/2, don't clear pending_requests/pending_responses
@@ -336,39 +356,49 @@ fn find_complete_h2_stream(conn: &Connection) -> Option<u32> {
         .copied()
 }
 
-fn is_request_complete(conn: &Connection) -> bool {
-    if conn.request_chunks.is_empty() {
-        return false;
-    }
+/// Try to parse HTTP/1 request from accumulated chunks.
+/// If complete, stores the parsed request in conn.h1_request.
+fn try_parse_http1_request_chunks(conn: &mut Connection) {
+    let all_data: Vec<u8> = conn
+        .request_chunks
+        .iter()
+        .flat_map(|c| c.data.clone())
+        .collect();
+    let timestamp = conn
+        .request_chunks
+        .last()
+        .map(|c| c.timestamp_ns)
+        .unwrap_or(0);
+    conn.h1_request = h1::try_parse_http1_request(&all_data, timestamp);
+}
 
+/// Try to parse HTTP/1 response from accumulated chunks.
+/// If complete, stores the parsed response in conn.h1_response.
+fn try_parse_http1_response_chunks(conn: &mut Connection) {
+    let all_data: Vec<u8> = conn
+        .response_chunks
+        .iter()
+        .flat_map(|c| c.data.clone())
+        .collect();
+    let timestamp = conn
+        .response_chunks
+        .first()
+        .map(|c| c.timestamp_ns)
+        .unwrap_or(0);
+    conn.h1_response = h1::try_parse_http1_response(&all_data, timestamp);
+}
+
+fn is_request_complete(conn: &Connection) -> bool {
     match conn.protocol {
-        Protocol::Http1 => {
-            let all_data: Vec<u8> = conn
-                .request_chunks
-                .iter()
-                .flat_map(|c| c.data.clone())
-                .collect();
-            h1::is_http1_message_complete(&all_data)
-        }
+        Protocol::Http1 => conn.h1_request.is_some(),
         Protocol::Http2 => find_complete_h2_stream(conn).is_some(),
         Protocol::Unknown => false,
     }
 }
 
 fn is_response_complete(conn: &Connection) -> bool {
-    if conn.response_chunks.is_empty() {
-        return false;
-    }
-
     match conn.protocol {
-        Protocol::Http1 => {
-            let all_data: Vec<u8> = conn
-                .response_chunks
-                .iter()
-                .flat_map(|c| c.data.clone())
-                .collect();
-            h1::is_http1_message_complete(&all_data)
-        }
+        Protocol::Http1 => conn.h1_response.is_some(),
         Protocol::Http2 => find_complete_h2_stream(conn).is_some(),
         Protocol::Unknown => false,
     }
@@ -377,33 +407,10 @@ fn is_response_complete(conn: &Connection) -> bool {
 fn build_exchange(conn: &mut Connection) -> Option<Exchange> {
     let (request, response, stream_id, latency_ns) = match conn.protocol {
         Protocol::Http1 => {
-            // For HTTP/1, use chunk timestamps
-            let request_time = conn
-                .request_chunks
-                .last()
-                .map(|c| c.timestamp_ns)
-                .unwrap_or(0);
-            let response_time = conn
-                .response_chunks
-                .first()
-                .map(|c| c.timestamp_ns)
-                .unwrap_or(0);
-
-            let request_data: Vec<u8> = conn
-                .request_chunks
-                .iter()
-                .flat_map(|c| c.data.clone())
-                .collect();
-            let req = h1::parse_http1_request(&request_data, request_time)?;
-
-            let response_data: Vec<u8> = conn
-                .response_chunks
-                .iter()
-                .flat_map(|c| c.data.clone())
-                .collect();
-            let resp = h1::parse_http1_response(&response_data, response_time)?;
-
-            let latency = response_time.saturating_sub(request_time);
+            // Take the already-parsed request and response
+            let req = conn.h1_request.take()?;
+            let resp = conn.h1_response.take()?;
+            let latency = resp.timestamp_ns.saturating_sub(req.timestamp_ns);
             (req, resp, None, latency)
         }
         Protocol::Http2 => {
