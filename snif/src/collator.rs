@@ -1,5 +1,5 @@
 use crate::h1;
-use h2session::{is_http2_preface, looks_like_http2_frame, H2ConnectionState, ParsedH2Message};
+use h2session::{H2ConnectionState, ParsedH2Message, is_http2_preface, looks_like_http2_frame};
 use snif_common::{Data, Kind, MAX_BUF_SIZE};
 use std::collections::HashMap;
 
@@ -417,8 +417,8 @@ fn build_exchange(conn: &mut Connection) -> Option<Exchange> {
             let request_complete_time = msg_req.end_stream_timestamp_ns;
             let response_start_time = msg_resp.first_frame_timestamp_ns;
 
-            let req = convert_h2_request(&msg_req)?;
-            let resp = convert_h2_response(&msg_resp)?;
+            let req = msg_req.to_http_request()?;
+            let resp = msg_resp.to_http_response()?;
 
             let latency = response_start_time.saturating_sub(request_complete_time);
             (req, resp, Some(sid), latency)
@@ -434,29 +434,6 @@ fn build_exchange(conn: &mut Connection) -> Option<Exchange> {
         tgid: conn.tgid,
         remote_port: conn.remote_port,
         stream_id,
-    })
-}
-
-/// Convert a ParsedH2Message to an HttpRequest
-fn convert_h2_request(msg: &ParsedH2Message) -> Option<HttpRequest> {
-    Some(HttpRequest {
-        method: msg.http_method()?,
-        uri: msg.http_uri()?,
-        headers: msg.http_headers(),
-        body: msg.body.clone(),
-        // Use the stream's end_stream timestamp (when request was fully sent)
-        timestamp_ns: msg.end_stream_timestamp_ns,
-    })
-}
-
-/// Convert a ParsedH2Message to an HttpResponse
-fn convert_h2_response(msg: &ParsedH2Message) -> Option<HttpResponse> {
-    Some(HttpResponse {
-        status: msg.http_status()?,
-        headers: msg.http_headers(),
-        body: msg.body.clone(),
-        // Use the stream's first_frame timestamp (when response started arriving)
-        timestamp_ns: msg.first_frame_timestamp_ns,
     })
 }
 
@@ -678,8 +655,7 @@ mod tests {
 
         // Body should be "helloworld", NOT "hellohelloworldhelloworldworld" (duplicated)
         assert_eq!(
-            request.body,
-            b"helloworld",
+            request.body, b"helloworld",
             "Body should not be duplicated when parsing incrementally"
         );
     }

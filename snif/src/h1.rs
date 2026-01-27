@@ -2,24 +2,8 @@
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 
-/// HTTP request parsed from HTTP/1.x data
-#[derive(Debug, Clone)]
-pub struct HttpRequest {
-    pub method: Method,
-    pub uri: Uri,
-    pub headers: HeaderMap,
-    pub body: Vec<u8>,
-    pub timestamp_ns: u64,
-}
-
-/// HTTP response parsed from HTTP/1.x data
-#[derive(Debug, Clone)]
-pub struct HttpResponse {
-    pub status: StatusCode,
-    pub headers: HeaderMap,
-    pub body: Vec<u8>,
-    pub timestamp_ns: u64,
-}
+// Re-export HTTP types from h2session for use across all HTTP versions
+pub use h2session::{HttpRequest, HttpResponse};
 
 /// Check if data starts with an HTTP/1.x request
 pub fn is_http1_request(data: &[u8]) -> bool {
