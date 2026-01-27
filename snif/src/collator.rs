@@ -221,6 +221,13 @@ impl Collator {
             }
         }
 
+        // For HTTP/2, a complete stream pair can be detected on either event.
+        // Ensure both flags are set when a complete pair exists.
+        if conn.protocol == Protocol::Http2 && find_complete_h2_stream(conn).is_some() {
+            conn.request_complete = true;
+            conn.response_complete = true;
+        }
+
         // If both request and response are complete, emit exchange
         if conn.request_complete && conn.response_complete {
             let exchange = build_exchange(conn);
@@ -451,4 +458,377 @@ fn convert_h2_response(msg: &ParsedH2Message) -> Option<HttpResponse> {
         // Use the stream's first_frame timestamp (when response started arriving)
         timestamp_ns: msg.first_frame_timestamp_ns,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snif_common::{ADDR_SIZE, MAX_BUF_SIZE, TASK_COMM_LEN};
+
+    /// Helper to create a Data event with minimal fields set
+    fn make_data_event(
+        kind: Kind,
+        conn_id: u64,
+        tgid: u32,
+        peer_port: u16,
+        timestamp_ns: u64,
+        buf: &[u8],
+    ) -> Data {
+        let mut data = Data {
+            kind,
+            len: buf.len() as i32,
+            conn_id,
+            timestamp_ns,
+            tgid,
+            peer_port,
+            local_port: 0,
+            family: 2, // AF_INET
+            _padding: 0,
+            local_addr: [0u8; ADDR_SIZE],
+            peer_addr: [0u8; ADDR_SIZE],
+            buf: [0u8; MAX_BUF_SIZE],
+            comm: [0u8; TASK_COMM_LEN],
+        };
+        data.buf[..buf.len()].copy_from_slice(buf);
+        data
+    }
+
+    // =========================================================================
+    // Issue 1: Port shows 0 for SSL connections
+    // =========================================================================
+
+    #[test]
+    fn test_ssl_port_zero_becomes_none() {
+        let mut collator = Collator::new();
+
+        // SSL event with port 0 (unavailable)
+        let event = make_data_event(
+            Kind::SslWrite,
+            0, // SSL uses tgid, not conn_id
+            1234,
+            0, // Port 0 = unavailable
+            1_000_000,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        );
+
+        let _ = collator.add_event(&event);
+
+        // Verify the connection was created with None for remote_port
+        let conn = collator.ssl_connections.get(&1234).unwrap();
+        assert_eq!(conn.remote_port, None, "Port 0 should become None");
+    }
+
+    #[test]
+    fn test_port_updated_from_later_event() {
+        let mut collator = Collator::new();
+
+        // First SSL event with port 0
+        let event1 = make_data_event(
+            Kind::SslWrite,
+            0,
+            1234,
+            0, // Port unknown
+            1_000_000,
+            b"GET / HTTP/1.1\r\n",
+        );
+
+        let _ = collator.add_event(&event1);
+        assert_eq!(
+            collator.ssl_connections.get(&1234).unwrap().remote_port,
+            None
+        );
+
+        // Second event with actual port (e.g., from socket event)
+        let event2 = make_data_event(
+            Kind::SslWrite,
+            0,
+            1234,
+            8080, // Now we know the port
+            2_000_000,
+            b"Host: example.com\r\n\r\n",
+        );
+
+        let _ = collator.add_event(&event2);
+
+        // Port should now be updated
+        assert_eq!(
+            collator.ssl_connections.get(&1234).unwrap().remote_port,
+            Some(8080),
+            "Port should be updated from later event"
+        );
+    }
+
+    // =========================================================================
+    // Issue 3: Body appears duplicated (HTTP/2 incremental parsing)
+    // =========================================================================
+
+    /// HTTP/2 connection preface
+    const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    /// Build an empty SETTINGS frame (9 bytes)
+    fn build_settings_frame() -> Vec<u8> {
+        vec![0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]
+    }
+
+    /// Build a HEADERS frame with END_HEADERS (but not END_STREAM, expects DATA)
+    fn build_headers_frame(stream_id: u32, hpack_block: &[u8]) -> Vec<u8> {
+        let len = hpack_block.len();
+        let mut frame = vec![
+            (len >> 16) as u8,
+            (len >> 8) as u8,
+            len as u8,
+            0x01, // HEADERS
+            0x04, // END_HEADERS only (body follows)
+            (stream_id >> 24) as u8 & 0x7F,
+            (stream_id >> 16) as u8,
+            (stream_id >> 8) as u8,
+            stream_id as u8,
+        ];
+        frame.extend_from_slice(hpack_block);
+        frame
+    }
+
+    /// Build a DATA frame with optional END_STREAM
+    fn build_data_frame(stream_id: u32, data: &[u8], end_stream: bool) -> Vec<u8> {
+        let len = data.len();
+        let flags = if end_stream { 0x01 } else { 0x00 };
+        let mut frame = vec![
+            (len >> 16) as u8,
+            (len >> 8) as u8,
+            len as u8,
+            0x00, // DATA
+            flags,
+            (stream_id >> 24) as u8 & 0x7F,
+            (stream_id >> 16) as u8,
+            (stream_id >> 8) as u8,
+            stream_id as u8,
+        ];
+        frame.extend_from_slice(data);
+        frame
+    }
+
+    /// Build HPACK for a complete GET request
+    fn hpack_get_request() -> Vec<u8> {
+        let mut block = Vec::new();
+        block.push(0x82); // :method: GET (static index 2)
+        block.push(0x87); // :scheme: https (static index 7)
+        block.push(0x84); // :path: / (static index 4)
+        // :authority literal without indexing (0x00 + name index 1 (from :authority))
+        // Index 1 is :authority in static table, so use 0x01 for indexed name
+        block.push(0x01); // Indexed name :authority (index 1)
+        block.push(0x0b); // Value length 11
+        block.extend_from_slice(b"example.com");
+        block
+    }
+
+    /// Build HPACK for :status 200 response
+    fn hpack_status_200() -> Vec<u8> {
+        vec![0x88] // Static table index 8
+    }
+
+    #[test]
+    fn test_h2_incremental_parsing_no_body_duplication() {
+        let mut collator = Collator::new();
+        let conn_id = 12345u64;
+        let tgid = 1000u32;
+
+        // Build HTTP/2 request: preface + settings + headers + data in chunks
+        let mut request_chunk1 = H2_PREFACE.to_vec();
+        request_chunk1.extend(build_settings_frame());
+        request_chunk1.extend(build_headers_frame(1, &hpack_get_request()));
+
+        // First chunk: preface + settings + headers
+        let event1 = make_data_event(
+            Kind::SocketWrite,
+            conn_id,
+            tgid,
+            8080,
+            1_000_000,
+            &request_chunk1,
+        );
+        let _ = collator.add_event(&event1);
+
+        // Second chunk: DATA frame with body "hello"
+        let data_frame1 = build_data_frame(1, b"hello", false);
+        let event2 = make_data_event(
+            Kind::SocketWrite,
+            conn_id,
+            tgid,
+            8080,
+            2_000_000,
+            &data_frame1,
+        );
+        let _ = collator.add_event(&event2);
+
+        // Third chunk: DATA frame with body "world" and END_STREAM
+        let data_frame2 = build_data_frame(1, b"world", true);
+        let event3 = make_data_event(
+            Kind::SocketWrite,
+            conn_id,
+            tgid,
+            8080,
+            3_000_000,
+            &data_frame2,
+        );
+        let _ = collator.add_event(&event3);
+
+        // Check the pending request body
+        let conn = collator.connections.get(&conn_id).unwrap();
+        let request = conn.pending_requests.get(&1).unwrap();
+
+        // Body should be "helloworld", NOT "hellohelloworldhelloworldworld" (duplicated)
+        assert_eq!(
+            request.body,
+            b"helloworld",
+            "Body should not be duplicated when parsing incrementally"
+        );
+    }
+
+    // =========================================================================
+    // Issue 2: Latency shows 0.00ms for HTTPS (per-stream timestamps)
+    // =========================================================================
+
+    #[test]
+    fn test_h2_per_stream_latency() {
+        let mut collator = Collator::new();
+        let conn_id = 99999u64;
+        let tgid = 2000u32;
+
+        // Request at t=1_000_000_000 (1 second)
+        let mut request = H2_PREFACE.to_vec();
+        request.extend(build_settings_frame());
+        // HEADERS with END_HEADERS | END_STREAM (0x05)
+        let hpack = hpack_get_request();
+        let mut headers = vec![
+            (hpack.len() >> 16) as u8,
+            (hpack.len() >> 8) as u8,
+            hpack.len() as u8,
+            0x01, // HEADERS
+            0x05, // END_HEADERS | END_STREAM
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Stream 1
+        ];
+        headers.extend(&hpack);
+        request.extend(headers);
+
+        let req_event = make_data_event(
+            Kind::SocketWrite,
+            conn_id,
+            tgid,
+            443,
+            1_000_000_000, // Request sent at 1 second
+            &request,
+        );
+        let _ = collator.add_event(&req_event);
+
+        // Response at t=1_050_000_000 (1.05 seconds = 50ms later)
+        let response_hpack = hpack_status_200();
+        let mut response = vec![
+            (response_hpack.len() >> 16) as u8,
+            (response_hpack.len() >> 8) as u8,
+            response_hpack.len() as u8,
+            0x01, // HEADERS
+            0x05, // END_HEADERS | END_STREAM
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Stream 1
+        ];
+        response.extend(&response_hpack);
+
+        let resp_event = make_data_event(
+            Kind::SocketRead,
+            conn_id,
+            tgid,
+            443,
+            1_050_000_000, // Response received at 1.05 seconds
+            &response,
+        );
+        let exchange = collator.add_event(&resp_event);
+
+        // Should have a complete exchange
+        assert!(exchange.is_some(), "Should produce a complete exchange");
+
+        let exchange = exchange.unwrap();
+
+        // Latency should be ~50ms (50_000_000 ns)
+        // The per-stream timestamps should give us accurate latency
+        assert!(
+            exchange.latency_ns > 0,
+            "Latency should be > 0, got {} ns",
+            exchange.latency_ns
+        );
+
+        // Verify it's approximately 50ms (allow some tolerance)
+        let expected_latency = 50_000_000u64; // 50ms
+        assert!(
+            exchange.latency_ns >= expected_latency - 1_000_000
+                && exchange.latency_ns <= expected_latency + 1_000_000,
+            "Expected latency ~50ms, got {} ns",
+            exchange.latency_ns
+        );
+    }
+
+    #[test]
+    fn test_exchange_display_port_unavailable() {
+        // Create an exchange with None port
+        let exchange = Exchange {
+            request: HttpRequest {
+                method: http::Method::GET,
+                uri: "/".parse().unwrap(),
+                headers: http::HeaderMap::new(),
+                body: vec![],
+                timestamp_ns: 0,
+            },
+            response: HttpResponse {
+                status: http::StatusCode::OK,
+                headers: http::HeaderMap::new(),
+                body: vec![],
+                timestamp_ns: 0,
+            },
+            latency_ns: 1_000_000,
+            protocol: Protocol::Http2,
+            tgid: 1234,
+            remote_port: None, // Port unavailable
+            stream_id: Some(1),
+        };
+
+        let display = format!("{exchange}");
+        assert!(
+            display.contains("Port: unavailable"),
+            "Should display 'unavailable' for None port"
+        );
+    }
+
+    #[test]
+    fn test_exchange_display_port_available() {
+        let exchange = Exchange {
+            request: HttpRequest {
+                method: http::Method::GET,
+                uri: "/".parse().unwrap(),
+                headers: http::HeaderMap::new(),
+                body: vec![],
+                timestamp_ns: 0,
+            },
+            response: HttpResponse {
+                status: http::StatusCode::OK,
+                headers: http::HeaderMap::new(),
+                body: vec![],
+                timestamp_ns: 0,
+            },
+            latency_ns: 1_000_000,
+            protocol: Protocol::Http2,
+            tgid: 1234,
+            remote_port: Some(8080), // Port available
+            stream_id: Some(1),
+        };
+
+        let display = format!("{exchange}");
+        assert!(
+            display.contains("Port: 8080"),
+            "Should display actual port number"
+        );
+    }
 }
