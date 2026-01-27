@@ -1,7 +1,7 @@
 use crate::h1;
 use h2session::{
-    is_http2_preface, looks_like_http2_frame, parse_frames_stateful, H2ConnectionState, ParseError,
-    ParsedH2Message,
+    H2ConnectionState, ParseError, ParsedH2Message, is_http2_preface, looks_like_http2_frame,
+    parse_frames_stateful,
 };
 use snif_common::{Data, Kind, MAX_BUF_SIZE};
 use std::collections::HashMap;
@@ -25,17 +25,14 @@ pub struct DataChunk {
 /// Tracks state for a single connection
 pub struct Connection {
     pub tgid: u32,
-    pub remote_port: u16,
+    /// Remote port, None if unavailable (e.g., SSL without socket fd)
+    pub remote_port: Option<u16>,
     pub protocol: Protocol,
     pub request_chunks: Vec<DataChunk>,
     pub response_chunks: Vec<DataChunk>,
     pub last_activity_ns: u64,
     pub request_complete: bool,
     pub response_complete: bool,
-
-    // HTTP/2 state (separate per direction for HPACK)
-    h2_request_state: Option<H2ConnectionState>,
-    h2_response_state: Option<H2ConnectionState>,
 
     // Completed messages from h2session, keyed by stream_id
     pending_requests: HashMap<u32, ParsedH2Message>,
@@ -46,15 +43,18 @@ impl Connection {
     pub fn new(tgid: u32, remote_port: u16) -> Self {
         Self {
             tgid,
-            remote_port,
+            // Store None for port 0 (unavailable from SSL)
+            remote_port: if remote_port == 0 {
+                None
+            } else {
+                Some(remote_port)
+            },
             protocol: Protocol::Unknown,
             request_chunks: Vec::new(),
             response_chunks: Vec::new(),
             last_activity_ns: 0,
             request_complete: false,
             response_complete: false,
-            h2_request_state: None,
-            h2_response_state: None,
             pending_requests: HashMap::new(),
             pending_responses: HashMap::new(),
         }
@@ -72,7 +72,8 @@ pub struct Exchange {
     pub latency_ns: u64,
     pub protocol: Protocol,
     pub tgid: u32,
-    pub remote_port: u16,
+    /// Remote port, None if unavailable (e.g., SSL without socket fd)
+    pub remote_port: Option<u16>,
     /// Stream ID for HTTP/2 (None for HTTP/1)
     pub stream_id: Option<u32>,
 }
@@ -85,11 +86,14 @@ impl std::fmt::Display for Exchange {
             Protocol::Unknown => "Unknown",
         };
         let latency_ms = self.latency_ns as f64 / 1_000_000.0;
+        let port_str = self
+            .remote_port
+            .map_or("unavailable".to_string(), |p| p.to_string());
 
         writeln!(
             f,
             "=== {} Exchange (PID: {}, Port: {}) ===",
-            proto_str, self.tgid, self.remote_port
+            proto_str, self.tgid, port_str
         )?;
         writeln!(f, "Latency: {:.2}ms", latency_ms)?;
         writeln!(f)?;
@@ -170,6 +174,11 @@ impl Collator {
 
         conn.last_activity_ns = data.timestamp_ns;
 
+        // Update port if we have a non-zero value (SSL events have 0)
+        if data.peer_port != 0 && conn.remote_port.is_none() {
+            conn.remote_port = Some(data.peer_port);
+        }
+
         // Detect protocol from first chunk if unknown
         if conn.protocol == Protocol::Unknown {
             conn.protocol = detect_protocol(buf);
@@ -228,7 +237,6 @@ impl Collator {
             // Note: For HTTP/2, don't clear pending_requests/pending_responses
             //       as they may contain other streams. The matched pair was
             //       already removed in build_exchange().
-            // Note: Keep h2_*_state for HPACK persistence across exchanges
 
             return exchange;
         }
@@ -265,7 +273,8 @@ fn detect_protocol(data: &[u8]) -> Protocol {
     Protocol::Unknown
 }
 
-/// Parse all accumulated request chunks through h2session
+/// Parse all accumulated request chunks through h2session.
+/// Resets parser state on each call to avoid body duplication from re-parsing DATA frames.
 fn parse_http2_request_chunks(conn: &mut Connection) {
     let all_data: Vec<u8> = conn
         .request_chunks
@@ -277,13 +286,14 @@ fn parse_http2_request_chunks(conn: &mut Connection) {
         return;
     }
 
-    // Get or create H2 state for request direction
-    let state = conn
-        .h2_request_state
-        .get_or_insert_with(H2ConnectionState::new);
+    // Reset h2 state on each parse to avoid body duplication.
+    // When parse_frames_stateful processes DATA frames, it extends stream.body.
+    // Re-parsing the same data would extend body again with duplicate data.
+    // By resetting state, we parse fresh each time with empty body.
+    let mut state = H2ConnectionState::new();
 
     // Parse and merge completed messages by stream_id
-    match parse_frames_stateful(&all_data, state) {
+    match parse_frames_stateful(&all_data, &mut state) {
         Ok(messages) => {
             for (stream_id, msg) in messages {
                 if msg.is_request() {
@@ -300,7 +310,8 @@ fn parse_http2_request_chunks(conn: &mut Connection) {
     }
 }
 
-/// Parse all accumulated response chunks through h2session
+/// Parse all accumulated response chunks through h2session.
+/// Resets parser state on each call to avoid body duplication from re-parsing DATA frames.
 fn parse_http2_response_chunks(conn: &mut Connection) {
     let all_data: Vec<u8> = conn
         .response_chunks
@@ -312,13 +323,12 @@ fn parse_http2_response_chunks(conn: &mut Connection) {
         return;
     }
 
-    // Get or create H2 state for response direction
-    let state = conn
-        .h2_response_state
-        .get_or_insert_with(H2ConnectionState::new);
+    // Reset h2 state on each parse to avoid body duplication.
+    // See parse_http2_request_chunks for detailed explanation.
+    let mut state = H2ConnectionState::new();
 
     // Parse and merge completed messages by stream_id
-    match parse_frames_stateful(&all_data, state) {
+    match parse_frames_stateful(&all_data, &mut state) {
         Ok(messages) => {
             for (stream_id, msg) in messages {
                 if msg.is_response() {
