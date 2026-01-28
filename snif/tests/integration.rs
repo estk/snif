@@ -416,3 +416,89 @@ async fn test_filter(
         _ => panic!("Unknown comparison: {}", comparison),
     }
 }
+
+// ============================================================================
+// Chunked and streaming response tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_chunked_streaming_response() {
+    let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
+
+    curl(&["-s", "--http1.1", "http://httpbin.org/stream-bytes/512"])
+        .await
+        .unwrap();
+
+    sniffer.collect_for(Duration::from_secs(2)).await;
+    let output = sniffer.stop().await;
+
+    assert!(
+        output.contains("HTTP/1.1 Exchange"),
+        "HTTP/1.1 exchange not captured"
+    );
+    assert!(
+        output.contains("transfer-encoding: chunked"),
+        "Chunked transfer-encoding not captured"
+    );
+    assert!(
+        output.contains("GET /stream-bytes/512"),
+        "Request path not captured"
+    );
+}
+
+// ============================================================================
+// Large response body tests (parameterized)
+// ============================================================================
+
+#[rstest]
+#[case::size_1000(1000)]
+#[case::size_10000(10000)]
+#[tokio::test]
+async fn test_large_response_body(#[case] size: usize) {
+    let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
+
+    let url = format!("http://httpbin.org/bytes/{}", size);
+    curl(&["-s", "--http1.1", &url]).await.unwrap();
+
+    sniffer.collect_for(Duration::from_secs(3)).await;
+    let output = sniffer.stop().await;
+
+    assert!(
+        output.contains("HTTP/1.1 Exchange"),
+        "HTTP/1.1 exchange not captured"
+    );
+    let expected_header = format!("content-length: {}", size);
+    assert!(
+        output.contains(expected_header.as_str()),
+        "Content-Length header not captured for size {}",
+        size
+    );
+}
+
+// ============================================================================
+// Compressed response tests
+// ============================================================================
+
+#[rstest]
+#[case::gzip("http://httpbin.org/gzip", "content-encoding: gzip")]
+#[case::deflate("http://httpbin.org/deflate", "content-encoding: deflate")]
+#[tokio::test]
+async fn test_compressed_response(#[case] url: &str, #[case] expected_encoding: &str) {
+    let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
+
+    curl(&["-s", "--http1.1", url]).await.unwrap();
+
+    sniffer.collect_for(Duration::from_secs(2)).await;
+    let output = sniffer.stop().await;
+
+    assert!(
+        output.contains("HTTP/1.1 Exchange"),
+        "HTTP/1.1 exchange not captured"
+    );
+    assert!(
+        output.contains(expected_encoding),
+        "{} header not captured",
+        expected_encoding
+    );
+}
+
