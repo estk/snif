@@ -16,7 +16,7 @@ use tokio::signal;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use snif_lib::collator::Collator;
+use snif_lib::Collator;
 use snif_lib::filter::{AddrFilter, Direction, Filters, PortFilter};
 
 /// CLI direction enum that maps to filter::Direction
@@ -293,7 +293,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let show_raw = opt.raw;
 
     // Create shared collator for request/response assembly
-    let collator = Arc::new(Mutex::new(Collator::new()));
+    let collator: Arc<Mutex<Collator<Data>>> = Arc::new(Mutex::new(Collator::new()));
 
     // Collect task handles for graceful shutdown
     let mut task_handles: Vec<JoinHandle<()>> = Vec::new();

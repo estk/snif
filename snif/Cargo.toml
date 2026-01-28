@@ -23,9 +23,9 @@ tokio = { version = "1.49", features = [
     "io-util",
 ] }
 bytes = "1.11.0"
-h2session = { path = "../../h2session" }
+h2session = { path = "../../h2session/crates/h2session" }
+http-collator = { path = "../../h2session/crates/http-collator" }
 http = "1"
-httparse = "1"
 tokio-util = "0.7"
 ipnetwork = "0.21"
 glob = "0.3"

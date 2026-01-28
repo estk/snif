@@ -502,3 +502,109 @@ async fn test_compressed_response(#[case] url: &str, #[case] expected_encoding: 
     );
 }
 
+// ============================================================================
+// Advanced chunked encoding tests
+// ============================================================================
+
+/// Test JSON streaming with multiple chunks containing multiple objects
+#[rstest]
+#[case::stream_5(5)]
+#[case::stream_10(10)]
+#[tokio::test]
+async fn test_json_streaming_multiple_chunks(#[case] count: usize) {
+    let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
+
+    let url = format!("http://httpbin.org/stream/{}", count);
+    curl(&["-s", "--http1.1", &url]).await.unwrap();
+
+    sniffer.collect_for(Duration::from_secs(3)).await;
+    let output = sniffer.stop().await;
+
+    assert!(
+        output.contains("HTTP/1.1 Exchange"),
+        "HTTP/1.1 exchange not captured"
+    );
+    assert!(
+        output.contains("transfer-encoding: chunked"),
+        "Chunked transfer-encoding not captured"
+    );
+    // Verify we captured multiple JSON objects (check for first and last id)
+    assert!(output.contains("\"id\": 0"), "First JSON object not captured");
+    let last_id = format!("\"id\": {}", count - 1);
+    assert!(
+        output.contains(last_id.as_str()),
+        "Last JSON object (id: {}) not captured",
+        count - 1
+    );
+}
+
+/// Test large chunked stream with configurable chunk sizes
+#[tokio::test]
+async fn test_large_chunked_stream() {
+    let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
+
+    // 50KB stream with 16KB chunks
+    curl(&[
+        "-s",
+        "--http1.1",
+        "http://httpbin.org/stream-bytes/51200?chunk_size=16384",
+    ])
+    .await
+    .unwrap();
+
+    sniffer.collect_for(Duration::from_secs(4)).await;
+    let output = sniffer.stop().await;
+
+    assert!(
+        output.contains("HTTP/1.1 Exchange"),
+        "HTTP/1.1 exchange not captured"
+    );
+    assert!(
+        output.contains("transfer-encoding: chunked"),
+        "Chunked transfer-encoding not captured"
+    );
+    assert!(
+        output.contains("GET /stream-bytes/51200"),
+        "Request path not captured"
+    );
+}
+
+/// Test chunked request body (Transfer-Encoding: chunked in request)
+#[tokio::test]
+async fn test_chunked_request_body() {
+    let mut sniffer = Sniffer::start(&["--collate"]).await.unwrap();
+
+    curl(&[
+        "-s",
+        "--http1.1",
+        "-X",
+        "POST",
+        "-H",
+        "Transfer-Encoding: chunked",
+        "-d",
+        "testchunkdata",
+        "http://httpbin.org/post",
+    ])
+    .await
+    .unwrap();
+
+    sniffer.collect_for(Duration::from_secs(2)).await;
+    let output = sniffer.stop().await;
+
+    assert!(
+        output.contains("HTTP/1.1 Exchange"),
+        "HTTP/1.1 exchange not captured"
+    );
+    assert!(output.contains("POST /post"), "POST request not captured");
+    // Request should have chunked transfer encoding
+    assert!(
+        output.contains("transfer-encoding: chunked"),
+        "Chunked request header not captured"
+    );
+    // Request body should be captured
+    assert!(
+        output.contains("testchunkdata"),
+        "Chunked request body not captured"
+    );
+}
+
