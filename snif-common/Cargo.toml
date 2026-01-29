@@ -5,7 +5,8 @@ edition.workspace = true
 
 [features]
 default = []
-user = ["aya"]
+user = ["aya", "http-collator"]
 
 [dependencies]
 aya = { workspace = true, optional = true }
+http-collator = { path = "../../h2session/crates/http-collator", optional = true }

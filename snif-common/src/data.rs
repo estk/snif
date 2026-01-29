@@ -249,3 +249,41 @@ impl std::fmt::Display for HandshakeEvent {
         )
     }
 }
+
+#[cfg(feature = "user")]
+impl http_collator::DataEvent for Data {
+    fn payload(&self) -> &[u8] {
+        let safe_len = if self.len <= 0 {
+            0
+        } else if self.len as usize > MAX_BUF_SIZE {
+            MAX_BUF_SIZE
+        } else {
+            self.len as usize
+        };
+        &self.buf[..safe_len]
+    }
+
+    fn timestamp_ns(&self) -> u64 {
+        self.timestamp_ns
+    }
+
+    fn direction(&self) -> http_collator::Direction {
+        match self.kind {
+            Kind::SslRead | Kind::SocketRead => http_collator::Direction::Read,
+            Kind::SslWrite | Kind::SocketWrite => http_collator::Direction::Write,
+            Kind::SslHandshake => http_collator::Direction::Other,
+        }
+    }
+
+    fn connection_id(&self) -> u64 {
+        self.conn_id
+    }
+
+    fn process_id(&self) -> u32 {
+        self.tgid
+    }
+
+    fn remote_port(&self) -> u16 {
+        self.peer_port
+    }
+}
